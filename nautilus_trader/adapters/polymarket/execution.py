@@ -1456,7 +1456,20 @@ class PolymarketExecutionClient(LiveExecutionClient):
             self._log.warning(f"Order already closed - skipping trade processing: {order}")
             return  # Already closed (only status update)
 
-        last_qty = instrument.make_qty(msg.last_qty(order_id))
+        # FAK orders can be overfilled
+        # cap the filled quantity to the remaining order quantity
+        raw_qty = msg.last_qty(self._wallet_address)
+        remaining_qty = order.quantity - order.filled_qty
+        capped_qty = min(raw_qty, remaining_qty)
+
+        if capped_qty < raw_qty:
+            self._log.warning(
+                f"Trade {trade_id} overfilled with {raw_qty} but order only has "
+                f"{remaining_qty} remaining. Capping fill at {capped_qty}",
+                LogColor.YELLOW,
+            )
+
+        last_qty = instrument.make_qty(capped_qty)
         last_px = instrument.make_price(msg.last_px(order_id))
         commission = float(last_qty * last_px) * basis_points_as_percentage(
             float(msg.get_fee_rate_bps(order_id)),
