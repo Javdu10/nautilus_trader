@@ -49,7 +49,7 @@ use crate::{
         client::KalshiHttpClient,
         error::KalshiHttpError,
         models::{Event, Field, Market, Series},
-        parse::{parse_instrument, supported_market_economics},
+        parse::{parse_instrument, supported_market},
         query::{EventQuery, HistoricalMarketsQuery, MarketsQuery},
     },
 };
@@ -249,7 +249,7 @@ impl KalshiInstrumentProvider {
             }
 
             let event = &events[&market.event_ticker];
-            if !selection.matches(&market, event) || !supported_market_economics(&market, event) {
+            if !selection.matches(&market, event) || !supported_market(&market, event) {
                 continue;
             }
 

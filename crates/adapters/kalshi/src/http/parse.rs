@@ -35,7 +35,6 @@ use ustr::Ustr;
 use super::{
     error::{KalshiHttpError, ResponseEvidence},
     models::{Event, Field, Market, VenueError},
-    netting::NettingState,
 };
 use crate::common::{
     consts::{PRICE_PRECISION, SIZE_PRECISION},
@@ -175,7 +174,7 @@ pub fn parse_instrument(
     ts_init: UnixNanos,
 ) -> anyhow::Result<BinaryOption> {
     anyhow::ensure!(
-        supported_market_economics(market, event),
+        supported_market(market, event),
         "unsupported market economics or family"
     );
     anyhow::ensure!(
@@ -251,12 +250,7 @@ pub fn parse_instrument(
     Ok(instrument)
 }
 
-/// Account-aware admission, separate from public instrument decoding.
-pub(crate) fn supported_market(market: &Market, event: &Event, netting: NettingState) -> bool {
-    supported_market_economics(market, event) && netting == NettingState::Disabled
-}
-
-pub(crate) fn supported_market_economics(market: &Market, event: &Event) -> bool {
+pub(crate) fn supported_market(market: &Market, event: &Event) -> bool {
     market.market_type == MarketType::Binary
         && market.notional_value_dollars.0 == Decimal::ONE
         && market.settlement_bounds_type == SettlementBoundsType::Default

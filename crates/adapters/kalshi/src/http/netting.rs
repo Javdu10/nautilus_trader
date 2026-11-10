@@ -261,7 +261,7 @@ impl KalshiHttpClient {
             .into());
         }
         anyhow::ensure!(
-            supported_market(market, event, state),
+            supported_market(market, event),
             "unsupported Kalshi market economics"
         );
         Ok(())
@@ -384,7 +384,7 @@ mod tests {
     #[case("missing", "false", false)]
     #[case("null", "absent", false)]
     #[case("null", "false", false)]
-    fn supported_market_requires_disabled_account_and_event(
+    fn market_admission_requires_disabled_account_and_event(
         #[case] account_flag: &str,
         #[case] saved_flag: &str,
         #[case] expected: bool,
@@ -396,7 +396,10 @@ mod tests {
         }
         let (account, positions) = evidence(account_flag, saved_flag);
         let state = NettingState::from_responses(&market, &event, &account, &positions);
-        assert_eq!(supported_market(&market, &event, state), expected);
+        assert_eq!(
+            state == NettingState::Disabled && supported_market(&market, &event),
+            expected
+        );
     }
 
     #[rstest]
@@ -429,7 +432,7 @@ mod tests {
             _ => unreachable!(),
         }
         let state = NettingState::from_responses(&market, &event, &account, &positions);
-        assert!(!supported_market(&market, &event, state));
+        assert!(state != NettingState::Disabled || !supported_market(&market, &event));
     }
 
     #[rstest]
@@ -441,7 +444,7 @@ mod tests {
         sibling.netting_enabled = Field::Value(true);
         positions.market_positions.push(sibling);
         let state = NettingState::from_responses(&market, &event, &account, &positions);
-        assert!(!supported_market(&market, &event, state));
+        assert!(state != NettingState::Disabled || !supported_market(&market, &event));
     }
 
     #[rstest]
@@ -469,6 +472,6 @@ mod tests {
             }
             _ => unreachable!(),
         }
-        assert!(!supported_market(&market, &event, NettingState::Disabled));
+        assert!(!supported_market(&market, &event));
     }
 }

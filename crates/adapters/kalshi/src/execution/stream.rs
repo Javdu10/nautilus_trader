@@ -177,7 +177,7 @@ impl PrivateStream {
         };
 
         let (balance, mut snapshot) = self.collect(receiver, &query, start).await?;
-        self.load_definitions(&snapshot, &[]).await?;
+        self.load_definitions(&snapshot).await?;
         self.filter_incoming_events(&mut snapshot);
         anyhow::ensure!(
             balance.balance_dollars.0 >= Decimal::ZERO
@@ -735,20 +735,12 @@ impl PrivateStream {
         Ok(settlements)
     }
 
-    async fn load_definitions(
-        &mut self,
-        snapshot: &KalshiExecutionSnapshot,
-        settlements: &[Settlement],
-    ) -> anyhow::Result<()> {
+    async fn load_definitions(&mut self, snapshot: &KalshiExecutionSnapshot) -> anyhow::Result<()> {
         let mut needed: HashSet<_> = self
             .instruments
             .iter()
             .map(|id| id.symbol.to_string())
             .collect();
-
-        for settlement in settlements {
-            needed.insert(settlement.instrument_id.symbol.to_string());
-        }
 
         for order in &snapshot.orders {
             needed.insert(order.ticker.clone());
@@ -776,10 +768,6 @@ impl PrivateStream {
             if settlement_targets.contains(&position.ticker) {
                 needed.insert(position.ticker.clone());
             }
-        }
-
-        for fill in &snapshot.fills {
-            needed.insert(fill.ticker.clone());
         }
 
         {
@@ -1474,7 +1462,7 @@ mod tests {
                     lookback_start: None, ts_init: UnixNanos::from(1),
                 };
                 private.instruments.insert(id);
-                assert!(private.load_definitions(&empty, &[]).await.is_err());
+                assert!(private.load_definitions(&empty).await.is_err());
                 assert!(private.definitions.contains_key(&id));
                 assert_eq!(private.state.lock().unwrap().positions, before);
 
@@ -1482,7 +1470,7 @@ mod tests {
                 let mut fresh = stream(&transport);
                 fresh.http = KalshiHttpClient::new_authenticated(&transport).unwrap();
                 fresh.instruments.insert(id);
-                fresh.load_definitions(&empty, &[]).await.unwrap();
+                fresh.load_definitions(&empty).await.unwrap();
                 assert!(!fresh.definitions.contains_key(&id));
                 assert!(fresh.state.lock().unwrap().positions.is_empty());
 
