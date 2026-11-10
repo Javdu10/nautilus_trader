@@ -134,7 +134,8 @@ impl KalshiDataClient {
 
         let http = KalshiHttpClient::new(&config)?;
         let clock = get_atomic_clock_realtime();
-        let provider = KalshiInstrumentProvider::new(http, clock, sender.clone());
+        let provider = KalshiInstrumentProvider::new(http, clock, sender.clone())
+            .with_netting_config(config.clone());
 
         let books = BookSyncTracker::new(
             &instruments,

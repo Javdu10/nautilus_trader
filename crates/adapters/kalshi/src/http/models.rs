@@ -428,6 +428,21 @@ pub struct IndexedBalance {
     pub balance: FixedPoint,
 }
 
+/// Collateral-return default for one subaccount and exchange shard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubaccountNettingConfig {
+    pub subaccount_number: u32,
+    pub exchange_index: u32,
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    pub enabled: Field<bool>,
+}
+
+/// Account collateral-return defaults, without inferred entries for missing scopes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubaccountNettingResponse {
+    pub netting_configs: Vec<SubaccountNettingConfig>,
+}
+
 /// Signed market position and exact economics, without an inferred entry price.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketPosition {
@@ -439,6 +454,9 @@ pub struct MarketPosition {
     pub realized_pnl_dollars: FixedPoint,
     pub fees_paid_dollars: FixedPoint,
     pub last_updated_ts: Timestamp,
+    /// Saved event/subaccount collateral-return setting; missing is not false.
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    pub netting_enabled: Field<bool>,
 }
 
 /// Event-level position economics.

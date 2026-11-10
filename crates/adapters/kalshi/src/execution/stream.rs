@@ -716,7 +716,12 @@ impl PrivateStream {
         snapshot: &KalshiExecutionSnapshot,
         settlements: &[Settlement],
     ) -> anyhow::Result<()> {
-        let mut needed = HashSet::new();
+        let mut needed: HashSet<_> = self
+            .instruments
+            .iter()
+            .map(|id| id.symbol.to_string())
+            .collect();
+
         for settlement in settlements {
             needed.insert(settlement.instrument_id.symbol.to_string());
         }
@@ -747,16 +752,26 @@ impl PrivateStream {
 
         for ticker in needed {
             let id = crate::common::parse::parse_instrument_id(&ticker)?;
-            if !self.definitions.contains_key(&id) {
+            let publish = !self.definitions.contains_key(&id);
+            let refresh_netting = self.definitions.get(&id).is_some_and(|definition| {
+                definition
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.get("event"))
+                    .and_then(|event| event.get("collateral_return_type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("MECNET")
+            });
+
+            if publish || refresh_netting {
                 let definition = load_definition(&self.http, &ticker, snapshot.ts_init).await?;
                 super::validate_definition(&definition, self.config.exchange_index)?;
-                if let Some(sender) = &self.data_sender {
+                if publish && let Some(sender) = &self.data_sender {
                     let data = InstrumentAny::BinaryOption(definition.clone()).into();
                     sender
                         .send(DataEvent::Data(data))
                         .map_err(|_| anyhow::anyhow!("private instrument receiver closed"))?;
                 }
-
                 self.definitions.insert(id, definition);
             }
         }

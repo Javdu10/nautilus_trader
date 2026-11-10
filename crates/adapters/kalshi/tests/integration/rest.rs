@@ -68,6 +68,7 @@ fn exact_response_fixtures_roundtrip_every_mapped_field() {
     roundtrip::<HistoricalCutoff>("cutoff");
     roundtrip::<Balance>("balance");
     roundtrip::<PositionsResponse>("positions");
+    roundtrip::<SubaccountNettingResponse>("subaccount_netting");
     roundtrip::<SettlementsResponse>("settlements");
     roundtrip::<FillsResponse>("fills");
     roundtrip::<OrdersResponse>("orders");
@@ -219,6 +220,13 @@ fn field_presence_and_unknown_order_status_are_preserved() {
     "/portfolio/balance?subaccount=0&exchange_index=3",
     true,
     "balance"
+)]
+#[case(
+    "subaccount_netting",
+    "GET",
+    "/portfolio/subaccounts/netting",
+    true,
+    "subaccount_netting"
 )]
 #[case(
     "positions",
@@ -477,6 +485,7 @@ async fn call(
     }
 
     match operation {
+        "subaccount_netting" => value!(client.get_subaccount_netting()),
         "status" => value!(client.get_status()),
         "markets" => value!(client.get_markets(&MarketsQuery {
             limit: Some(2),
@@ -1222,6 +1231,8 @@ async fn invalid_batch_identities_never_dispatch() {
 }
 
 #[rstest]
+#[case(false, "netting_conflict")]
+#[case(true, "netting_conflict")]
 #[case(false, "both")]
 #[case(true, "both")]
 #[case(false, "market")]
@@ -1249,7 +1260,7 @@ async fn position_pages_preserve_both_lists_and_bound_progress(
         first["cursor"] = Value::String("next+&".into());
         let mut second = first.clone();
 
-        if !matches!(mode, "repeat" | "duplicates") {
+        if !matches!(mode, "repeat" | "duplicates" | "netting_conflict") {
             if mode != "event" {
                 let mut market = second["market_positions"][0].clone();
                 market["exchange_index"] = Value::Number(4.into());
@@ -1270,6 +1281,8 @@ async fn position_pages_preserve_both_lists_and_bound_progress(
             second = fixture("empty_positions");
             expected = serde_json::from_value(fixture("positions")).unwrap();
         }
+
+        if mode == "netting_conflict" { second["market_positions"][0]["netting_enabled"] = true.into(); }
 
         let budget = if mode == "budget" { 1 } else { 2 };
         if mode == "budget" { expected = serde_json::from_value(fixture("positions")).unwrap(); }
@@ -1303,7 +1316,9 @@ async fn position_pages_preserve_both_lists_and_bound_progress(
             assert_eq!(request.lines().next().unwrap(),format!("GET /custom/v3{path} HTTP/1.1"));
         }
 
-        if matches!(mode,"repeat" | "duplicates") {
+        if mode == "netting_conflict" {
+            assert!(matches!(result, Err(KalshiHttpError::Parse(ref message)) if message == "conflicting position netting evidence"));
+        } else if matches!(mode,"repeat" | "duplicates") {
             assert!(matches!(result,Err(KalshiHttpError::Pagination(_))));
         } else {
             let result = result.unwrap();
@@ -2150,4 +2165,34 @@ fn transcript_child(mutate: bool) -> Vec<String> {
         .filter(|line| line.starts_with("kalshi-dst-"))
         .map(str::to_owned)
         .collect()
+}
+
+#[rstest]
+#[case(None, Field::Missing)]
+#[case(Some(Value::Null), Field::Null)]
+#[case(Some(Value::Bool(false)), Field::Value(false))]
+#[case(Some(Value::Bool(true)), Field::Value(true))]
+fn position_netting_preserves_missing_null_and_boolean_states(
+    #[case] flag: Option<Value>,
+    #[case] expected: Field<bool>,
+) {
+    let mut value = fixture("positions")["market_positions"][0].clone();
+    value.as_object_mut().unwrap().remove("netting_enabled");
+    if let Some(flag) = flag {
+        value["netting_enabled"] = flag;
+    }
+    let parsed: MarketPosition = serde_json::from_value(value).unwrap();
+    assert_eq!(parsed.netting_enabled, expected);
+}
+
+#[rstest]
+#[case(Value::String("false".into()))]
+#[case(Value::Number(0.into()))]
+fn malformed_netting_flags_do_not_decode_as_disabled(#[case] flag: Value) {
+    let mut position = fixture("positions")["market_positions"][0].clone();
+    position["netting_enabled"] = flag.clone();
+    assert!(serde_json::from_value::<MarketPosition>(position).is_err());
+    let mut account = fixture("subaccount_netting");
+    account["netting_configs"][0]["enabled"] = flag;
+    assert!(serde_json::from_value::<SubaccountNettingResponse>(account).is_err());
 }

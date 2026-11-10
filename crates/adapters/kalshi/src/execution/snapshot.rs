@@ -859,6 +859,9 @@ pub(super) async fn load_definition(
         .await?
         .event;
 
+    if event.collateral_return_type == crate::common::enums::CollateralReturnType::Mecnet {
+        http.require_supported_market(&market, &event).await?;
+    }
     let series = http.get_series(&event.series_ticker).await?.series;
     crate::providers::KalshiInstrumentProvider::parse(&market, &event, &series, ts_init)
 }

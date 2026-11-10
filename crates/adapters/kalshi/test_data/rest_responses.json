@@ -476,7 +476,8 @@
         "market_exposure_dollars": "1.020002",
         "realized_pnl_dollars": "-0.030003",
         "fees_paid_dollars": "0.040004",
-        "last_updated_ts": "2026-10-16T06:06:06.600000006Z"
+        "last_updated_ts": "2026-10-16T06:06:06.600000006Z",
+        "netting_enabled": false
       }
     ],
     "event_positions": [
@@ -773,5 +774,8 @@
     "method": "DELETE",
     "path": "/trade-api/v2/portfolio/events/orders/batched",
     "cost": 16
+  },
+  "subaccount_netting": {
+    "netting_configs": [{"subaccount_number": 0, "exchange_index": 3, "enabled": false}]
   }
 }

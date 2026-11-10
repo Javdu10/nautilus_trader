@@ -26,7 +26,7 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 
 use crate::{
-    common::enums::FeeType,
+    common::enums::{CollateralReturnType, FeeType},
     http::{client::KalshiHttpClient, models::Field, query::EventQuery},
 };
 
@@ -223,6 +223,18 @@ pub(super) async fn hold(
         event.event_ticker == event_id.as_str(),
         "fee event identity mismatch"
     );
+
+    if event.collateral_return_type == CollateralReturnType::Mecnet {
+        let market = http
+            .get_market(definition.raw_symbol.as_str())
+            .await?
+            .market;
+        anyhow::ensure!(
+            market.ticker == definition.raw_symbol.as_str(),
+            "netting market identity mismatch"
+        );
+        http.require_supported_market(&market, &event).await?;
+    }
 
     let series = http.get_series(&event.series_ticker).await?.series;
     anyhow::ensure!(

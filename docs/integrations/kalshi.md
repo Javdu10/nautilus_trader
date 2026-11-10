@@ -148,12 +148,26 @@ The instrument provider accepts only markets with:
 - `settlement_bounds_type=default`.
 - USD 1 contract notional.
 - No multivariate collection or selected legs.
-- The documented empty `collateral_return_type`, indicating no collateral-return netting.
+- An empty `collateral_return_type` or `MECNET` capability. A `MECNET` provider request requires
+  authenticated evidence that collateral return is disabled for the primary account and event.
 
 #### Rejection rules and unsupported operations
 
-- **Rejected economics**: The provider rejects unknown product or collateral behavior, `MECNET`,
-  `DIRECNET`, scalar payouts, and nonzero settlement floors.
+- **Rejected economics**: The provider rejects unknown product or collateral behavior, `DIRECNET`,
+  scalar payouts, and nonzero settlement floors.
+- **Disabled netting only**: MECNET execution admission reads `GET /portfolio/subaccounts/netting` for
+  primary subaccount `0` and the market's exchange shard. It requires `enabled=false`. Existing
+  records from a complete `GET /portfolio/positions` event query must report
+  `netting_enabled=false`, including exited positions with zero quantity. Enabled, missing, null,
+  conflicting, or wrong-scope evidence blocks admission.
+- **No position records**: A complete empty event response inherits the current account default.
+  This is distinct from an existing position whose saved setting is missing. Kalshi records the
+  event setting when its first order is placed, including an unfilled or canceled order; the empty
+  response fallback assumes that no independently saved setting contradicts the current default.
+- **Fresh checks**: Startup/recovery reloads relevant definitions and netting evidence. Single and
+  batch submissions and exposure-changing amendments check again during preparation. Public binary
+  instrument decoding alone is not execution authorization. Settings reads and order submission are
+  separate API calls; an external settings change cannot be made atomic with the first order.
 - **Netting test**: `mutually_exclusive=false` does not prove that an event has no netting.
 - **Settlement floors**: A missing, null, or zero `settlement_floor_dollars` does not exclude an
   ordinary contract.

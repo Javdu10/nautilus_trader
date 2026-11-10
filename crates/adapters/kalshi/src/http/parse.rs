@@ -35,6 +35,7 @@ use ustr::Ustr;
 use super::{
     error::{KalshiHttpError, ResponseEvidence},
     models::{Event, Field, Market, VenueError},
+    netting::NettingState,
 };
 use crate::common::{
     consts::{PRICE_PRECISION, SIZE_PRECISION},
@@ -162,6 +163,8 @@ impl Pagination {
 /// Maps an admitted ordinary market to the canonical YES-priced instrument.
 ///
 /// The retained market and event metadata restore grid and shard context on restart.
+/// Decoding a MECNET-capable binary instrument does not authorize trading: account-aware
+/// admission must separately establish disabled account and event collateral return.
 ///
 /// # Errors
 ///
@@ -172,7 +175,7 @@ pub fn parse_instrument(
     ts_init: UnixNanos,
 ) -> anyhow::Result<BinaryOption> {
     anyhow::ensure!(
-        supported_market(market, event),
+        supported_market_economics(market, event),
         "unsupported market economics or family"
     );
     anyhow::ensure!(
@@ -248,11 +251,19 @@ pub fn parse_instrument(
     Ok(instrument)
 }
 
-pub(crate) fn supported_market(market: &Market, event: &Event) -> bool {
+/// Account-aware admission, separate from public instrument decoding.
+pub(crate) fn supported_market(market: &Market, event: &Event, netting: NettingState) -> bool {
+    supported_market_economics(market, event) && netting == NettingState::Disabled
+}
+
+pub(crate) fn supported_market_economics(market: &Market, event: &Event) -> bool {
     market.market_type == MarketType::Binary
         && market.notional_value_dollars.0 == Decimal::ONE
         && market.settlement_bounds_type == SettlementBoundsType::Default
-        && event.collateral_return_type == CollateralReturnType::None
+        && matches!(
+            event.collateral_return_type,
+            CollateralReturnType::None | CollateralReturnType::Mecnet
+        )
         && !matches!(&market.settlement_floor_dollars, Field::Value(v) if v.0 != Decimal::ZERO)
         && !matches!(&market.mve_collection_ticker, Field::Value(v) if !v.is_empty())
         && !matches!(&market.mve_selected_legs, Field::Value(v) if !v.is_empty())
