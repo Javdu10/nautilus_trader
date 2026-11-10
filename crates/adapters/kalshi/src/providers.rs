@@ -253,8 +253,16 @@ impl KalshiInstrumentProvider {
                 continue;
             }
 
-            if event.collateral_return_type == CollateralReturnType::Mecnet {
-                self.require_supported_market(&market, event).await?;
+            if event.collateral_return_type == CollateralReturnType::Mecnet
+                && let Err(e) = self.require_supported_market(&market, event).await
+            {
+                if e.downcast_ref::<crate::http::netting::EventNettingError>()
+                    .is_some()
+                {
+                    log::warn!("Skipping Kalshi market {}: {e}", market.ticker);
+                    continue;
+                }
+                return Err(e);
             }
 
             if !series.contains_key(&event.series_ticker) {

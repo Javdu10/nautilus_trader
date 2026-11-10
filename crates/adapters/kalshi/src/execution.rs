@@ -259,6 +259,67 @@ impl KalshiExecutionClient {
         Ok(instrument)
     }
 
+    async fn excluded_report_event(
+        &self,
+        ticker: &str,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<bool> {
+        if self
+            .http
+            .excludes_netting_event(ticker, self.config.exchange_index)
+        {
+            return Ok(true);
+        }
+
+        match self.definition(ticker, ts_init).await {
+            Ok(_) => Ok(false),
+            Err(e)
+                if e.downcast_ref::<crate::http::netting::EventNettingError>()
+                    .is_some() =>
+            {
+                log::warn!("Ignoring Kalshi reconciliation evidence for {ticker}: {e}");
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn exclude_snapshot_events(
+        &self,
+        snapshot: &mut KalshiExecutionSnapshot,
+    ) -> anyhow::Result<()> {
+        let tickers: HashSet<_> = snapshot
+            .orders
+            .iter()
+            .map(|value| value.ticker.clone())
+            .chain(snapshot.fills.iter().map(|value| value.ticker.clone()))
+            .chain(snapshot.positions.iter().map(|value| value.ticker.clone()))
+            .collect();
+        let mut excluded = HashSet::new();
+
+        for ticker in tickers {
+            if self
+                .excluded_report_event(&ticker, snapshot.ts_init)
+                .await?
+            {
+                excluded.insert(ticker);
+            }
+        }
+        snapshot
+            .orders
+            .retain(|value| !excluded.contains(&value.ticker));
+        snapshot
+            .fills
+            .retain(|value| !excluded.contains(&value.ticker));
+        snapshot
+            .positions
+            .retain(|value| !excluded.contains(&value.ticker));
+        snapshot
+            .positions_settled
+            .retain(|value| !excluded.contains(&value.ticker));
+        Ok(())
+    }
+
     fn client_order_id(&self, value: &VenueOrder) -> anyhow::Result<Option<ClientOrderId>> {
         let venue_order_id = VenueOrderId::new_checked(&value.order_id)?;
 
@@ -323,6 +384,10 @@ impl KalshiExecutionClient {
         max_pages: u32,
         cutoff: Option<&HistoricalCutoff>,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
+        if self.excluded_report_event(&value.ticker, ts_init).await? {
+            return Ok(None);
+        }
+
         let recovered = self
             .private
             .lock()
@@ -1172,6 +1237,11 @@ impl ExecutionClient for KalshiExecutionClient {
                 ),
             "targeted order identity mismatch"
         );
+
+        if self.excluded_report_event(&value.ticker, ts_init).await? {
+            return Ok(None);
+        }
+
         let report = self
             .order_report(value, ts_init)
             .await?
@@ -1247,7 +1317,7 @@ impl ExecutionClient for KalshiExecutionClient {
         let ts_init = self.clock.get_time_ns();
         let cutoff = self.http.get_historical_cutoff().await?;
         let ticker = cmd.instrument_id.as_ref().map(|id| id.symbol.as_str());
-        let orders =
+        let mut orders =
             collect_orders(&self.http, &self.config.account_query(), ticker, max_pages).await?;
 
         let query = FillsQuery {
@@ -1260,6 +1330,27 @@ impl ExecutionClient for KalshiExecutionClient {
 
         let fills =
             collect_fills(&self.http, &query, cmd.start, ts_init, &cutoff, max_pages).await?;
+        let mut excluded = HashSet::new();
+
+        for value in orders.values() {
+            if cmd
+                .instrument_id
+                .is_some_and(|id| id.symbol.as_str() != value.ticker)
+                || cmd
+                    .venue_order_id
+                    .is_some_and(|id| id.as_str() != value.order_id)
+                || cmd.end.is_some_and(|end| {
+                    timestamp(&value.last_update_time).is_ok_and(|time| time > end)
+                })
+            {
+                continue;
+            }
+
+            if self.excluded_report_event(&value.ticker, ts_init).await? {
+                excluded.insert(value.ticker.clone());
+            }
+        }
+        orders.retain(|_, value| !excluded.contains(&value.ticker));
         let mut reports = Vec::new();
 
         for value in &fills {
@@ -1276,6 +1367,12 @@ impl ExecutionClient for KalshiExecutionClient {
             let ts_event = timestamp(&value.created_time)?;
 
             if cmd.end.is_some_and(|end| ts_event > end) {
+                continue;
+            }
+
+            if excluded.contains(&value.ticker)
+                || self.excluded_report_event(&value.ticker, ts_init).await?
+            {
                 continue;
             }
 
@@ -1325,6 +1422,10 @@ impl ExecutionClient for KalshiExecutionClient {
                 continue;
             }
 
+            if self.excluded_report_event(&value.ticker, ts_init).await? {
+                continue;
+            }
+
             let definition = self.definition(&value.ticker, ts_init).await?;
             let report = reports::position(value, &definition, self.core.account_id, ts_init)?;
             if cmd.start.is_none_or(|start| report.ts_last >= start)
@@ -1347,7 +1448,7 @@ impl ExecutionClient for KalshiExecutionClient {
             .transpose()?
             .map(|duration| requested_at.saturating_sub(duration));
         let max_pages = 100;
-        let snapshot = collect_snapshot_at(
+        let mut snapshot = collect_snapshot_at(
             &self.http,
             &self.config.account_query(),
             start,
@@ -1355,6 +1456,7 @@ impl ExecutionClient for KalshiExecutionClient {
             requested_at,
         )
         .await?;
+        self.exclude_snapshot_events(&mut snapshot).await?;
         let mut orders = Vec::new();
         let mut omitted = 0;
 
@@ -1681,6 +1783,17 @@ impl KalshiExecutionClient {
         let mut identities = HashSet::new();
 
         for cmd in cancels {
+            if self.http.excludes_netting_event(
+                cmd.instrument_id.symbol.as_str(),
+                self.config.exchange_index,
+            ) {
+                log::warn!(
+                    "Ignoring cancellation for excluded Kalshi instrument {}",
+                    cmd.instrument_id
+                );
+                continue;
+            }
+
             anyhow::ensure!(
                 identities.insert(cmd.client_order_id),
                 "duplicate Kalshi cancellation identity"
@@ -1841,6 +1954,13 @@ impl KalshiExecutionClient {
     }
 
     fn prepare_change(&self, command: &Command, cached: &OrderAny) -> anyhow::Result<Mutation> {
+        anyhow::ensure!(
+            !self.http.excludes_netting_event(
+                cached.instrument_id().symbol.as_str(),
+                self.config.exchange_index
+            ),
+            "Kalshi event is excluded; existing orders are unmanaged"
+        );
         let deadline = Instant::now() + ADMISSION_TIMEOUT;
         self.observe_settlement();
         let id = command.client_order_id();

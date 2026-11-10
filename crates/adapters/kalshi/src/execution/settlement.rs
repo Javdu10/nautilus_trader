@@ -109,6 +109,25 @@ struct Seal {
 }
 
 impl SettlementBarrier {
+    pub(super) fn exclude_instruments(&mut self, excluded: impl Fn(InstrumentId) -> bool) {
+        let before =
+            self.tracked.len() + self.receipts.len() + self.reports.len() + self.seals.len();
+        self.tracked.retain(|id| !excluded(*id));
+        self.receipts
+            .retain(|_, receipt| !excluded(receipt.instrument_id));
+        self.reports.retain(|_, (id, _)| !excluded(*id));
+        self.seals.retain(|id, _| !excluded(*id));
+
+        if before > 0
+            && self.tracked.is_empty()
+            && self.receipts.is_empty()
+            && self.reports.is_empty()
+            && self.seals.is_empty()
+        {
+            self.blocked = false;
+        }
+    }
+
     pub(super) fn invalidate(&mut self, session: &str) {
         self.session = session.to_owned();
         self.observed = false;

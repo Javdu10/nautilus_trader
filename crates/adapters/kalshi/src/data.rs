@@ -1281,7 +1281,15 @@ async fn refresh(
         let instrument = tokio::select! {
             biased;
             () = cancellation.cancelled() => anyhow::bail!("metadata refresh canceled"),
-            result = provider.load_instrument(&request) => result?,
+            result = provider.load_instrument(&request) => match result {
+                Ok(instrument) => instrument,
+                Err(e) if e.downcast_ref::<crate::http::netting::EventNettingError>().is_some() => {
+                    log::warn!("Skipping Kalshi instrument {id}: {e}");
+                    context.lock().expect("context lock is not poisoned").remove(id);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
         };
         lifecycle.apply(instrument, stamp, context, sender)?;
     }

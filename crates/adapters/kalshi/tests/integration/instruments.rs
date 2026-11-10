@@ -1486,13 +1486,16 @@ async fn mecnet_provider_rechecks_exchange_account_and_saved_position_settings()
                         positions["market_positions"] = serde_json::json!([position]);
                     }
                     positions
+                } else if path.ends_with("/markets") {
+                    serde_json::json!({"markets": [original["market"], values["definitions"]["live"]["market"]], "cursor": ""})
                 } else if path.contains("/markets/") {
                     serde_json::json!({"market": original["market"]})
                 } else if path.contains("/events/") {
-                    serde_json::json!({"event": original["event"], "markets": []})
+                    let event = if path.ends_with(original["event"]["event_ticker"].as_str().unwrap()) { &original["event"] } else { &values["definitions"]["live"]["event"] };
+                    serde_json::json!({"event": event, "markets": []})
                 } else if path.contains("/series/") {
                     let mut series = values["series"].clone();
-                    series["series"]["ticker"] = original["event"]["series_ticker"].clone();
+                    series["series"]["ticker"] = path.rsplit('/').next().unwrap().into();
                     series
                 } else { panic!("unexpected test path {path}"); };
                 let body = body.to_string();
@@ -1522,6 +1525,20 @@ async fn mecnet_provider_rechecks_exchange_account_and_saved_position_settings()
                 let DataEvent::Response(DataResponse::Instrument(response)) = receiver.try_recv().unwrap() else { panic!("expected instrument response") };
                 assert_eq!(response.instrument_id, id);
             } else { assert!(receiver.try_recv().is_err()); }
+        }
+        // Bulk discovery skips only the excluded event and still returns the eligible market.
+        for current in [2, 3, 1] {
+            mode.store(current, Ordering::SeqCst);
+            let result = provider.request_instruments(RequestInstruments::new(None, None, None, Some(*KALSHI_VENUE), UUID4::new(), UnixNanos::from(1), None)).await;
+            if current == 1 {
+                assert!(result.is_err(), "account-wide enabled setting must fail discovery");
+                assert!(receiver.try_recv().is_err());
+            } else {
+                result.unwrap();
+                let DataEvent::Response(DataResponse::Instruments(response)) = receiver.try_recv().unwrap() else { panic!("expected instruments response") };
+                assert_eq!(response.data.len(), 1);
+                assert_ne!(response.data[0].id(), id);
+            }
         }
         server.abort();
     })).await.unwrap();

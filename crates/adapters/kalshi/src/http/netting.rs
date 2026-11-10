@@ -33,10 +33,29 @@ pub(crate) enum NettingState {
     Unknown,
 }
 
+/// The account default prevents this execution client from trading any event.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Kalshi account netting must be disabled for primary subaccount 0/shard {shard} (state {state:?})"
+)]
+pub(crate) struct AccountNettingError {
+    pub(crate) shard: u32,
+    pub(crate) state: NettingState,
+}
+
+/// One event is excluded without disabling eligible events in the account.
+#[derive(Debug, thiserror::Error)]
+#[error("Kalshi event {event} excluded: saved netting state {state:?}")]
+pub(crate) struct EventNettingError {
+    pub(crate) event: String,
+    pub(crate) state: NettingState,
+}
+
 /// Admission evidence belongs to one transport/account and is shared by its clones.
 #[derive(Debug, Default)]
 pub(super) struct NettingAdmission {
     states: Mutex<HashMap<(String, u32), NettingState>>,
+    markets: Mutex<HashMap<(String, u32), String>>,
 }
 
 impl NettingAdmission {
@@ -63,7 +82,30 @@ impl NettingAdmission {
         self.states
             .lock()
             .expect("netting admission lock is not poisoned")
-            .clear();
+            .retain(|_, state| *state != NettingState::Disabled);
+    }
+
+    fn register(&self, ticker: &str, event: &str, shard: u32) {
+        self.markets
+            .lock()
+            .expect("netting market lock is not poisoned")
+            .insert((ticker.to_owned(), shard), event.to_owned());
+    }
+
+    fn excludes(&self, ticker: &str, shard: u32) -> bool {
+        let event = self
+            .markets
+            .lock()
+            .expect("netting market lock is not poisoned")
+            .get(&(ticker.to_owned(), shard))
+            .cloned();
+        event.is_some_and(|event| {
+            self.states
+                .lock()
+                .expect("netting admission lock is not poisoned")
+                .get(&(event, shard))
+                .is_some_and(|state| *state != NettingState::Disabled)
+        })
     }
 }
 
@@ -140,6 +182,11 @@ impl KalshiHttpClient {
         self.netting.clear();
     }
 
+    /// Tests the cached event exclusion without making a request.
+    pub(crate) fn excludes_netting_event(&self, ticker: &str, shard: u32) -> bool {
+        self.netting.excludes(ticker, shard)
+    }
+
     /// Checks startup/reconciliation evidence without making a request.
     pub(crate) fn require_disabled_netting(&self, event: &str, shard: u32) -> anyhow::Result<()> {
         self.netting.require_disabled(event, shard)
@@ -155,10 +202,38 @@ impl KalshiHttpClient {
             Field::Value(value) => u32::try_from(value)?,
             _ => anyhow::bail!("netting admission requires an explicit market shard"),
         };
+        self.netting
+            .register(&market.ticker, &event.event_ticker, shard);
         // A failed refresh must not retain a previous successful admission.
         self.netting
             .set(&event.event_ticker, shard, NettingState::Unknown);
-        let account = self.get_subaccount_netting().await?;
+        let account = self
+            .get_subaccount_netting()
+            .await
+            .map_err(|_| AccountNettingError {
+                shard,
+                state: NettingState::Unknown,
+            })?;
+        let mut configs = account
+            .netting_configs
+            .iter()
+            .filter(|config| config.subaccount_number == 0 && config.exchange_index == shard);
+        let account_state = match (configs.next(), configs.next()) {
+            (Some(config), None) => match config.enabled {
+                Field::Value(false) => NettingState::Disabled,
+                Field::Value(true) => NettingState::Enabled,
+                Field::Missing | Field::Null => NettingState::Unknown,
+            },
+            _ => NettingState::Unknown,
+        };
+
+        if account_state != NettingState::Disabled {
+            return Err(AccountNettingError {
+                shard,
+                state: account_state,
+            }
+            .into());
+        }
         let positions = self
             .get_all_positions(
                 PositionsQuery {
@@ -171,13 +246,23 @@ impl KalshiHttpClient {
                 },
                 100,
             )
-            .await?;
+            .await
+            .map_err(|_| EventNettingError {
+                event: event.event_ticker.clone(),
+                state: NettingState::Unknown,
+            })?;
         let state = NettingState::from_responses(market, event, &account, &positions);
         self.netting.set(&event.event_ticker, shard, state);
+        if state != NettingState::Disabled {
+            return Err(EventNettingError {
+                event: event.event_ticker.clone(),
+                state,
+            }
+            .into());
+        }
         anyhow::ensure!(
             supported_market(market, event, state),
-            "Kalshi market {} is unsupported: account/event netting must be disabled (state {state:?})",
-            market.ticker
+            "unsupported Kalshi market economics"
         );
         Ok(())
     }
@@ -217,6 +302,26 @@ mod tests {
         assert!(admission.require_disabled("EVENT", 0).is_ok());
         admission.set("EVENT", 0, state);
         assert!(admission.require_disabled("EVENT", 0).is_err());
+    }
+
+    #[rstest]
+    #[case(NettingState::Enabled)]
+    #[case(NettingState::Unknown)]
+    fn event_exclusion_uses_confirmed_market_event_and_shard(#[case] state: NettingState) {
+        let admission = NettingAdmission::default();
+        admission.register("EVENT-A", "EVENT", 0);
+        admission.register("EVENT-B", "EVENT", 0);
+        admission.register("EVENT-NESTED-A", "EVENT-NESTED", 0);
+        admission.set("EVENT", 0, state);
+        admission.set("EVENT-NESTED", 0, NettingState::Disabled);
+        assert!(admission.excludes("EVENT-A", 0));
+        assert!(admission.excludes("EVENT-B", 0));
+        assert!(!admission.excludes("EVENT-NESTED-A", 0));
+        assert!(!admission.excludes("EVENT-A", 1));
+        admission.clear();
+        assert!(admission.excludes("EVENT-A", 0));
+        admission.set("EVENT", 0, NettingState::Disabled);
+        assert!(!admission.excludes("EVENT-A", 0));
     }
 
     fn definition() -> (Market, Event) {
