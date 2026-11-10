@@ -37,6 +37,7 @@ use url::Url;
 use super::{
     error::KalshiHttpError,
     models::*,
+    netting::NettingAdmission,
     parse::{Pages, Pagination, decode_body, decode_response, unexpected_response},
     query::*,
     quota::{Bucket, Charge, KalshiQuota},
@@ -68,6 +69,7 @@ pub struct KalshiHttpClient {
     dispatch_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     quota: Arc<KalshiQuota>,
     timeout_ms: u64,
+    pub(super) netting: Arc<NettingAdmission>,
 }
 
 impl KalshiHttpClient {
@@ -1503,6 +1505,7 @@ impl KalshiHttpClient {
             dispatch_check: None,
             quota: Arc::new(KalshiQuota::new()),
             timeout_ms: config.http_timeout_secs.saturating_mul(1_000),
+            netting: Arc::default(),
         })
     }
 }

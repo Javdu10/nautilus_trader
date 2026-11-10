@@ -157,6 +157,7 @@ impl PrivateStream {
         &mut self,
         receiver: &mut tokio::sync::mpsc::UnboundedReceiver<KalshiWsEvent>,
     ) -> anyhow::Result<()> {
+        self.http.invalidate_netting();
         let epoch = self
             .ws_client
             .connection_epoch()
@@ -1244,6 +1245,90 @@ mod tests {
             ),
             (None, None) => assert_eq!(result.unwrap(), Decimal::new(6277, 4)),
         }
+    }
+
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    #[tokio::test]
+    async fn mecnet_order_holds_use_recovery_evidence_without_netting_requests() {
+        use std::sync::atomic::AtomicUsize;
+
+        use crate::http::{
+            models::{Event, Market},
+            parse::parse_instrument,
+        };
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let definitions: serde_json::Value = serde_json::from_str(include_str!("../../test_data/instruments.json")).unwrap();
+            let market: Market = serde_json::from_value(definitions["definitions"]["unsupported"]["market"].clone()).unwrap();
+            let event: Event = serde_json::from_value(definitions["definitions"]["unsupported"]["event"].clone()).unwrap();
+            let instrument = parse_instrument(&market, &event, UnixNanos::from(1)).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let transport = KalshiDataClientConfig {
+                base_url_http: Some(format!("http://{}", listener.local_addr().unwrap()).into()),
+                api_key_id: Some("cached-netting-key".into()),
+                private_key: Some(keys::ed25519_pkcs8().into()),
+                ..Default::default()
+            };
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let mode = Arc::new(AtomicUsize::new(0));
+            let server_mode = Arc::clone(&mode);
+            let response_event = definitions["definitions"]["unsupported"]["event"].clone();
+            let mut series = definitions["series"].clone();
+            series["series"]["ticker"] = response_event["series_ticker"].clone();
+            let fixtures: serde_json::Value = serde_json::from_str(include_str!("../../test_data/rest_responses.json")).unwrap();
+
+            let server = tokio::spawn(serve_recovery(listener, Arc::clone(&observed), move |target| { // tokio-import-ok
+                let body = if target.starts_with("/account/limits") {
+                    fixtures["limits"].clone()
+                } else if target.starts_with("/account/endpoint_costs") {
+                    fixtures["costs"].clone()
+                } else if target.starts_with("/portfolio/subaccounts/netting") {
+                    let current = server_mode.load(Ordering::SeqCst);
+                    if current == 2 { return (400, serde_json::json!({})); }
+                    serde_json::json!({"netting_configs": [{"subaccount_number": 0, "exchange_index": 0, "enabled": current == 1}]})
+                } else if target.starts_with("/portfolio/positions") {
+                    fixtures["empty_positions"].clone()
+                } else if target.starts_with("/events/") {
+                    serde_json::json!({"event": response_event, "markets": []})
+                } else {
+                    assert!(target.starts_with("/series/"), "unexpected order-path request {target}");
+                    series.clone()
+                };
+                (200, body)
+            }));
+            let mut private = stream(&transport);
+            private.http = KalshiHttpClient::new_authenticated(&transport).unwrap();
+            let id = instrument.id;
+            private.definitions.insert(id, instrument);
+
+            // Startup/reconciliation resolves the event before any orders are admitted.
+            private.http.require_supported_market(&market, &event).await.unwrap();
+            observed.lock().unwrap().clear();
+
+            for _ in 0..2 {
+                assert!(private.hold(id, OrderSide::Buy, Decimal::ONE, Decimal::new(6001, 4)).await.is_ok());
+            }
+            let paths = observed.lock().unwrap().clone();
+            assert_eq!(paths.len(), 4);
+            assert!(paths.iter().all(|path| path.starts_with("/events/") || path.starts_with("/series/")));
+
+            // Recovery invalidation blocks even a previously admitted event until it is resolved.
+            private.http.invalidate_netting();
+            assert!(private.hold(id, OrderSide::Buy, Decimal::ONE, Decimal::new(6001, 4)).await.is_err());
+            private.http.require_supported_market(&market, &event).await.unwrap();
+
+            // Failed and enabled refreshes cannot leave an earlier successful admission active.
+            for current in [2, 1] {
+                mode.store(current, Ordering::SeqCst);
+                assert!(private.http.require_supported_market(&market, &event).await.is_err());
+                observed.lock().unwrap().clear();
+                assert!(private.hold(id, OrderSide::Buy, Decimal::ONE, Decimal::new(6001, 4)).await.is_err());
+                let paths = observed.lock().unwrap().clone();
+                assert_eq!(paths.len(), 1);
+                assert!(paths[0].starts_with("/events/"));
+            }
+            server.abort();
+        }).await.unwrap();
     }
 
     #[cfg(not(all(feature = "simulation", madsim)))]

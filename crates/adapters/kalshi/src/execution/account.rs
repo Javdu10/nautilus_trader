@@ -225,15 +225,14 @@ pub(super) async fn hold(
     );
 
     if event.collateral_return_type == CollateralReturnType::Mecnet {
-        let market = http
-            .get_market(definition.raw_symbol.as_str())
-            .await?
-            .market;
-        anyhow::ensure!(
-            market.ticker == definition.raw_symbol.as_str(),
-            "netting market identity mismatch"
-        );
-        http.require_supported_market(&market, &event).await?;
+        let shard = definition
+            .info
+            .as_ref()
+            .and_then(|info| info.get("market"))
+            .and_then(|market| market.get("exchange_index"))
+            .and_then(serde_json::Value::as_u64)
+            .context("netting market shard is missing")?;
+        http.require_disabled_netting(event_id.as_str(), u32::try_from(shard)?)?;
     }
 
     let series = http.get_series(&event.series_ticker).await?.series;
