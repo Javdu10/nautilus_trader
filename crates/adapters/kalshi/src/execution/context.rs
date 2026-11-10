@@ -116,43 +116,6 @@ impl PrivateState {
         }
     }
 
-    /// Removes unsupported event state without deriving positions or emitting synthetic events.
-    pub(super) fn exclude_instruments(
-        &mut self,
-        excluded: impl Fn(InstrumentId) -> bool,
-        excluded_orders: &HashSet<VenueOrderId>,
-    ) {
-        let removed: HashSet<_> = self
-            .orders
-            .iter()
-            .filter(|(_, context)| excluded(context.order.instrument_id()))
-            .map(|(id, _)| *id)
-            .collect();
-        let removed_venues: HashSet<_> = self
-            .bindings
-            .iter()
-            .filter(|(_, id)| removed.contains(id))
-            .map(|(venue, _)| *venue)
-            .collect();
-        self.orders.retain(|id, _| !removed.contains(id));
-        self.bindings.retain(|_, id| !removed.contains(id));
-        self.submissions.retain(|id| !removed.contains(id));
-        self.mutations.retain(|id, _| !removed.contains(id));
-        self.positions.retain(|id, _| !excluded(*id));
-        self.positions_ts.retain(|id, _| !excluded(*id));
-        self.external_leaves.retain(|(id, _), _| !excluded(*id));
-        self.notices_positions.retain(|id, _| !excluded(*id));
-        self.notices_fills
-            .retain(|_, notice| notice.instrument.is_none_or(|id| !excluded(id)));
-        self.covered_fills.retain(|id, _| !excluded(*id));
-        self.notices_orders
-            .retain(|id, _| !removed_venues.contains(id) && !excluded_orders.contains(id));
-        self.barrier
-            .lock()
-            .expect("settlement barrier lock")
-            .exclude_instruments(&excluded);
-    }
-
     pub(super) fn requires_rebase(&self, order: &OrderAny) -> bool {
         !self.ledger.total_is_unknown()
             && !order.trade_ids().is_empty()

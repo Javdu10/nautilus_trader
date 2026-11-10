@@ -1284,8 +1284,10 @@ async fn refresh(
             result = provider.load_instrument(&request) => match result {
                 Ok(instrument) => instrument,
                 Err(e) if e.downcast_ref::<crate::http::netting::EventNettingError>().is_some() => {
+                    if context.lock().expect("context lock is not poisoned").contains_key(id) {
+                        return Err(e);
+                    }
                     log::warn!("Skipping Kalshi instrument {id}: {e}");
-                    context.lock().expect("context lock is not poisoned").remove(id);
                     continue;
                 }
                 Err(e) => return Err(e),

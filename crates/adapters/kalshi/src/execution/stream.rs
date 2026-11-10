@@ -178,7 +178,7 @@ impl PrivateStream {
 
         let (balance, mut snapshot) = self.collect(receiver, &query, start).await?;
         self.load_definitions(&snapshot, &[]).await?;
-        self.exclude_events(&mut snapshot);
+        self.filter_incoming_events(&mut snapshot);
         anyhow::ensure!(
             balance.balance_dollars.0 >= Decimal::ZERO
                 && balance.balance_dollars.0.normalize().scale() <= 4,
@@ -821,8 +821,10 @@ impl PrivateStream {
                         if e.downcast_ref::<crate::http::netting::EventNettingError>()
                             .is_some() =>
                     {
+                        if self.definitions.contains_key(&id) {
+                            return Err(e);
+                        }
                         log::warn!("Ignoring Kalshi instrument {id} during recovery: {e}");
-                        self.definitions.remove(&id);
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -845,17 +847,12 @@ impl PrivateStream {
         Ok(())
     }
 
-    fn exclude_events(&self, snapshot: &mut KalshiExecutionSnapshot) {
+    /// Skips unsupported incoming records before they enter normal reconciliation.
+    fn filter_incoming_events(&self, snapshot: &mut KalshiExecutionSnapshot) {
         let excluded = |ticker: &str| {
             self.http
                 .excludes_netting_event(ticker, self.config.exchange_index)
         };
-        let excluded_orders: HashSet<_> = snapshot
-            .orders
-            .iter()
-            .filter(|order| excluded(&order.ticker))
-            .filter_map(|order| VenueOrderId::new_checked(&order.order_id).ok())
-            .collect();
         snapshot.orders.retain(|order| !excluded(&order.ticker));
         snapshot.fills.retain(|fill| !excluded(&fill.ticker));
         snapshot
@@ -864,10 +861,6 @@ impl PrivateStream {
         snapshot
             .positions_settled
             .retain(|position| !excluded(&position.ticker));
-        self.state
-            .lock()
-            .expect("private state lock is not poisoned")
-            .exclude_instruments(|id| excluded(id.symbol.as_str()), &excluded_orders);
     }
 
     async fn prepare_orders(
@@ -1452,7 +1445,6 @@ mod tests {
                 let eligible_id = crate::common::parse::parse_instrument_id("ELIGIBLE-A").unwrap();
                 {
                     let mut state = private.state.lock().unwrap();
-                    state.positions.insert(id, Decimal::from(100));
                     state.positions.insert(eligible_id, Decimal::ONE);
                 }
                 let mut snapshot = KalshiExecutionSnapshot {
@@ -1462,16 +1454,37 @@ mod tests {
                     cutoff: serde_json::from_value(evidence["cutoff"].clone()).unwrap(),
                     lookback_start: None, ts_init: UnixNanos::from(1),
                 };
-                private.exclude_events(&mut snapshot);
+                let before = private.state.lock().unwrap().positions.clone();
+                private.filter_incoming_events(&mut snapshot);
+                assert_eq!(private.state.lock().unwrap().positions, before);
                 assert_eq!(snapshot.orders.len(), 1);
                 assert_eq!(snapshot.fills.len(), 1);
                 assert_eq!(snapshot.positions.len(), 1);
                 assert_eq!(snapshot.positions_settled.len(), 1);
                 assert_eq!(snapshot.positions[0].ticker, "ELIGIBLE-A");
-                let state = private.state.lock().unwrap();
-                assert!(!state.positions.contains_key(&id));
-                assert_eq!(state.positions.get(&eligible_id), Some(&Decimal::ONE));
-                drop(state);
+                {
+                    let state = private.state.lock().unwrap();
+                    assert!(!state.positions.contains_key(&id));
+                    assert_eq!(state.positions.get(&eligible_id), Some(&Decimal::ONE));
+                }
+
+                let empty = KalshiExecutionSnapshot {
+                    orders: Vec::new(), fills: Vec::new(), positions: Vec::new(), positions_settled: Vec::new(),
+                    cutoff: serde_json::from_value(evidence["cutoff"].clone()).unwrap(),
+                    lookback_start: None, ts_init: UnixNanos::from(1),
+                };
+                private.instruments.insert(id);
+                assert!(private.load_definitions(&empty, &[]).await.is_err());
+                assert!(private.definitions.contains_key(&id));
+                assert_eq!(private.state.lock().unwrap().positions, before);
+
+                // A fresh client skips the unsupported requested instrument at ingestion.
+                let mut fresh = stream(&transport);
+                fresh.http = KalshiHttpClient::new_authenticated(&transport).unwrap();
+                fresh.instruments.insert(id);
+                fresh.load_definitions(&empty, &[]).await.unwrap();
+                assert!(!fresh.definitions.contains_key(&id));
+                assert!(fresh.state.lock().unwrap().positions.is_empty());
 
                 // The excluded payload is deliberately unusable for normal position accounting.
                 private.ready.store(true, Ordering::Release);
