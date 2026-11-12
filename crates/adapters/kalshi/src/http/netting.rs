@@ -66,25 +66,6 @@ impl NettingAdmission {
             .insert((event.to_owned(), shard), state);
     }
 
-    fn require_disabled(&self, event: &str, shard: u32) -> anyhow::Result<()> {
-        let states = self
-            .states
-            .lock()
-            .expect("netting admission lock is not poisoned");
-        anyhow::ensure!(
-            states.get(&(event.to_owned(), shard)) == Some(&NettingState::Disabled),
-            "Kalshi event {event} netting is not resolved as disabled for shard {shard}; startup/reconciliation required"
-        );
-        Ok(())
-    }
-
-    fn clear(&self) {
-        self.states
-            .lock()
-            .expect("netting admission lock is not poisoned")
-            .retain(|_, state| *state != NettingState::Disabled);
-    }
-
     fn register(&self, ticker: &str, event: &str, shard: u32) {
         self.markets
             .lock()
@@ -177,19 +158,9 @@ impl NettingState {
 }
 
 impl KalshiHttpClient {
-    /// Invalidates evidence before a new execution recovery pass.
-    pub(crate) fn invalidate_netting(&self) {
-        self.netting.clear();
-    }
-
     /// Tests the cached event exclusion without making a request.
     pub(crate) fn excludes_netting_event(&self, ticker: &str, shard: u32) -> bool {
         self.netting.excludes(ticker, shard)
-    }
-
-    /// Checks startup/reconciliation evidence without making a request.
-    pub(crate) fn require_disabled_netting(&self, event: &str, shard: u32) -> anyhow::Result<()> {
-        self.netting.require_disabled(event, shard)
     }
 
     /// Refreshes admission evidence during discovery or execution recovery, never per order.
@@ -204,16 +175,7 @@ impl KalshiHttpClient {
         };
         self.netting
             .register(&market.ticker, &event.event_ticker, shard);
-        // A failed refresh must not retain a previous successful admission.
-        self.netting
-            .set(&event.event_ticker, shard, NettingState::Unknown);
-        let account = self
-            .get_subaccount_netting()
-            .await
-            .map_err(|_| AccountNettingError {
-                shard,
-                state: NettingState::Unknown,
-            })?;
+        let account = self.get_subaccount_netting().await?;
         let mut configs = account
             .netting_configs
             .iter()
@@ -228,6 +190,7 @@ impl KalshiHttpClient {
         };
 
         if account_state != NettingState::Disabled {
+            self.netting.set(&event.event_ticker, shard, account_state);
             return Err(AccountNettingError {
                 shard,
                 state: account_state,
@@ -246,11 +209,7 @@ impl KalshiHttpClient {
                 },
                 100,
             )
-            .await
-            .map_err(|_| EventNettingError {
-                event: event.event_ticker.clone(),
-                state: NettingState::Unknown,
-            })?;
+            .await?;
         let state = NettingState::from_responses(market, event, &account, &positions);
         self.netting.set(&event.event_ticker, shard, state);
         if state != NettingState::Disabled {
@@ -277,20 +236,20 @@ mod tests {
     use crate::{common::enums::CollateralReturnType, http::models::MarketPosition};
 
     #[rstest]
-    fn admission_cache_is_shared_by_clones_and_requires_resolved_scope() {
+    fn admission_cache_is_shared_by_clones_and_preserves_account_scope() {
         let client =
             KalshiHttpClient::new(&crate::config::KalshiDataClientConfig::default()).unwrap();
         let clone = client.clone();
         let separate =
             KalshiHttpClient::new(&crate::config::KalshiDataClientConfig::default()).unwrap();
-        assert!(clone.require_disabled_netting("EVENT", 0).is_err());
+        client.netting.register("EVENT-A", "EVENT", 0);
         client.netting.set("EVENT", 0, NettingState::Disabled);
-        assert!(clone.require_disabled_netting("EVENT", 0).is_ok());
-        assert!(clone.require_disabled_netting("EVENT", 1).is_err());
-        assert!(clone.require_disabled_netting("OTHER", 0).is_err());
-        assert!(separate.require_disabled_netting("EVENT", 0).is_err());
-        client.invalidate_netting();
-        assert!(clone.require_disabled_netting("EVENT", 0).is_err());
+        assert!(!clone.excludes_netting_event("EVENT-A", 0));
+        client.netting.set("EVENT", 0, NettingState::Enabled);
+        assert!(clone.excludes_netting_event("EVENT-A", 0));
+        assert!(!clone.excludes_netting_event("EVENT-A", 1));
+        assert!(!clone.excludes_netting_event("OTHER-A", 0));
+        assert!(!separate.excludes_netting_event("EVENT-A", 0));
     }
 
     #[rstest]
@@ -298,10 +257,11 @@ mod tests {
     #[case(NettingState::Unknown)]
     fn refreshed_unsupported_state_replaces_previous_admission(#[case] state: NettingState) {
         let admission = NettingAdmission::default();
+        admission.register("EVENT-A", "EVENT", 0);
         admission.set("EVENT", 0, NettingState::Disabled);
-        assert!(admission.require_disabled("EVENT", 0).is_ok());
+        assert!(!admission.excludes("EVENT-A", 0));
         admission.set("EVENT", 0, state);
-        assert!(admission.require_disabled("EVENT", 0).is_err());
+        assert!(admission.excludes("EVENT-A", 0));
     }
 
     #[rstest]
@@ -318,8 +278,6 @@ mod tests {
         assert!(admission.excludes("EVENT-B", 0));
         assert!(!admission.excludes("EVENT-NESTED-A", 0));
         assert!(!admission.excludes("EVENT-A", 1));
-        admission.clear();
-        assert!(admission.excludes("EVENT-A", 0));
         admission.set("EVENT", 0, NettingState::Disabled);
         assert!(!admission.excludes("EVENT-A", 0));
     }
