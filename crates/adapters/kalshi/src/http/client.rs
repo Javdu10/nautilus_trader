@@ -37,7 +37,6 @@ use url::Url;
 use super::{
     error::KalshiHttpError,
     models::*,
-    netting::NettingAdmission,
     parse::{Pages, Pagination, decode_body, decode_response, unexpected_response},
     query::*,
     quota::{Bucket, Charge, KalshiQuota},
@@ -69,7 +68,6 @@ pub struct KalshiHttpClient {
     dispatch_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     quota: Arc<KalshiQuota>,
     timeout_ms: u64,
-    pub(super) netting: Arc<NettingAdmission>,
 }
 
 impl KalshiHttpClient {
@@ -464,11 +462,11 @@ impl KalshiHttpClient {
         self.get(&["portfolio", "balance"], query, true).await
     }
 
-    /// Fetches collateral-return defaults for all subaccounts and exchange shards.
+    /// Fetches netting defaults for all subaccounts and exchange shards.
     ///
     /// # Errors
     ///
-    /// Returns an error if authentication, quota admission, transport, or decoding fails.
+    /// Returns an error if authentication, transport, or decoding fails.
     pub async fn get_subaccount_netting(
         &self,
     ) -> Result<SubaccountNettingResponse, KalshiHttpError> {
@@ -1106,29 +1104,15 @@ impl KalshiHttpClient {
             next_cursor: query.cursor().map(str::to_owned),
         };
 
-        let mut netting_flags = HashMap::new();
-
         for _ in 0..max_pages {
             let page = fetch(query.clone()).await?;
             let empty = page.market_positions.is_empty() && page.event_positions.is_empty();
             let previous = result.market_positions.len() + result.event_positions.len();
-            for position in page.market_positions {
-                let key = (position.exchange_index, position.ticker.clone());
-                if let Some(previous) = netting_flags.insert(key, position.netting_enabled.clone())
-                    && previous != position.netting_enabled
-                {
-                    return Err(KalshiHttpError::Parse(
-                        "conflicting position netting evidence".into(),
-                    ));
-                }
-
-                if pagination.retain(format!(
-                    "market:{}:{}",
-                    position.exchange_index, position.ticker
-                )) {
-                    result.market_positions.push(position);
-                }
-            }
+            result
+                .market_positions
+                .extend(page.market_positions.into_iter().filter(|p| {
+                    pagination.retain(format!("market:{}:{}", p.exchange_index, p.ticker))
+                }));
 
             result.event_positions.extend(
                 page.event_positions
@@ -1505,7 +1489,6 @@ impl KalshiHttpClient {
             dispatch_check: None,
             quota: Arc::new(KalshiQuota::new()),
             timeout_ms: config.http_timeout_secs.saturating_mul(1_000),
-            netting: Arc::default(),
         })
     }
 }

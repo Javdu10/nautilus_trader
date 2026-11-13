@@ -770,12 +770,12 @@
     "path": "/trade-api/v2/portfolio/events/orders/batched",
     "cost": 11
   },
+  "subaccount_netting": {
+    "netting_configs": [{"subaccount_number": 0, "exchange_index": 3, "enabled": false}]
+  },
   "batch_cancel_cost": {
     "method": "DELETE",
     "path": "/trade-api/v2/portfolio/events/orders/batched",
     "cost": 16
-  },
-  "subaccount_netting": {
-    "netting_configs": [{"subaccount_number": 0, "exchange_index": 3, "enabled": false}]
   }
 }

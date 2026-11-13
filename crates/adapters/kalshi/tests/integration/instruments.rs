@@ -310,7 +310,7 @@ fn unsupported_and_inconsistent_metadata_is_rejected(#[case] mutation: &str) {
 }
 
 #[rstest]
-fn captured_mecnet_event_decodes_without_authorizing_execution() {
+fn captured_mecnet_event_is_supported() {
     let (market, event) = definition("unsupported");
     let instrument = parse_instrument(&market, &event, UnixNanos::from(1)).unwrap();
     assert_eq!(instrument.event_id.unwrap().as_str(), event.event_ticker);
@@ -1431,115 +1431,4 @@ fn definition(name: &str) -> (Market, Event) {
 
 fn decimal(value: &str) -> Decimal {
     Decimal::from_str_exact(value).unwrap()
-}
-
-#[cfg(not(all(feature = "simulation", madsim)))]
-#[tokio::test]
-async fn mecnet_provider_rechecks_exchange_account_and_saved_position_settings() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    use tokio::{io::AsyncWriteExt, net::TcpListener};
-
-    Box::pin(time::timeout(Duration::from_secs(15), async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let mode = Arc::new(AtomicUsize::new(0));
-        let server_mode = Arc::clone(&mode);
-        let values = fixtures();
-        let original = values["definitions"]["unsupported"].clone();
-        let ticker = original["market"]["ticker"].as_str().unwrap().to_string();
-        let ticker_server = ticker.clone();
-
-        let server = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let request = peer::read_headers(&mut stream).await;
-                let target = request.lines().next().unwrap().split_whitespace().nth(1).unwrap();
-                assert!(request.starts_with("GET "));
-                let path = target.split('?').next().unwrap();
-                let current = server_mode.load(Ordering::SeqCst);
-                let rest: Value = serde_json::from_str(include_str!("../../test_data/rest_responses.json")).unwrap();
-                let body = if path.ends_with("/account/limits") {
-                    rest["limits"].clone()
-                } else if path.ends_with("/account/endpoint_costs") {
-                    rest["costs"].clone()
-                } else if path.ends_with("/portfolio/subaccounts/netting") {
-                    assert!(request.to_lowercase().contains("kalshi-access-signature:"));
-                    serde_json::json!({"netting_configs":[{"subaccount_number":0,"exchange_index":0,"enabled": current == 1}]})
-                } else if path.ends_with("/portfolio/positions") {
-                    assert!(target.contains("event_ticker="));
-                    assert!(target.contains("subaccount=0"));
-                    assert!(target.contains("exchange_index=0"));
-                    assert!(target.contains("settlement_status=all"));
-                    assert!(!target.contains("count_filter"));
-                    let mut positions = rest["empty_positions"].clone();
-                    if current != 0 {
-                        let mut position = rest["positions"]["market_positions"][0].clone();
-                        position["ticker"] = ticker_server.clone().into();
-                        position["exchange_index"] = 0.into();
-                        position["position_fp"] = "0.00".into();
-                        if current == 3 { position.as_object_mut().unwrap().remove("netting_enabled"); }
-                        else { position["netting_enabled"] = (current == 2).into(); }
-                        positions["market_positions"] = serde_json::json!([position]);
-                    }
-                    positions
-                } else if path.ends_with("/markets") {
-                    serde_json::json!({"markets": [original["market"], values["definitions"]["live"]["market"]], "cursor": ""})
-                } else if path.contains("/markets/") {
-                    serde_json::json!({"market": original["market"]})
-                } else if path.contains("/events/") {
-                    let event = if path.ends_with(original["event"]["event_ticker"].as_str().unwrap()) { &original["event"] } else { &values["definitions"]["live"]["event"] };
-                    serde_json::json!({"event": event, "markets": []})
-                } else if path.contains("/series/") {
-                    let mut series = values["series"].clone();
-                    series["series"]["ticker"] = path.rsplit('/').next().unwrap().into();
-                    series
-                } else { panic!("unexpected test path {path}"); };
-                let body = body.to_string();
-                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-                stream.flush().await.unwrap();
-            }
-        });
-        let config = KalshiDataClientConfig {
-            api_key_id: Some("netting-test-key".into()),
-            private_key: Some(super::keys::ed25519_pkcs8().into()),
-            base_url_http: Some(format!("http://{address}/trade-api/v2").into()),
-            http_timeout_secs: 2,
-            ..Default::default()
-        };
-        let http = KalshiHttpClient::new_authenticated(&config).unwrap();
-        let clock = Box::leak(Box::new(AtomicTime::new(false, UnixNanos::from(1))));
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let provider = KalshiInstrumentProvider::new(http, clock, sender.into());
-        let id = parse_instrument_id(&ticker).unwrap();
-        // Same provider must not keep a prior successful admission as authorization.
-        for (current, accepted) in [(0, true), (1, false), (2, false), (3, false), (4, true)] {
-            mode.store(current, Ordering::SeqCst);
-            let request = RequestInstrument::new(id, None, None, None, UUID4::new(), UnixNanos::from(1), None);
-            let result = provider.request_instrument(request).await;
-            assert_eq!(result.is_ok(), accepted, "mode {current}: {result:?}");
-            if accepted {
-                let DataEvent::Response(DataResponse::Instrument(response)) = receiver.try_recv().unwrap() else { panic!("expected instrument response") };
-                assert_eq!(response.instrument_id, id);
-            } else { assert!(receiver.try_recv().is_err()); }
-        }
-        // Bulk discovery skips only the excluded event and still returns the eligible market.
-        for current in [2, 3, 1] {
-            mode.store(current, Ordering::SeqCst);
-            let result = provider.request_instruments(RequestInstruments::new(None, None, None, Some(*KALSHI_VENUE), UUID4::new(), UnixNanos::from(1), None)).await;
-            if current == 1 {
-                assert!(result.is_err(), "account-wide enabled setting must fail discovery");
-                assert!(receiver.try_recv().is_err());
-            } else {
-                result.unwrap();
-                let DataEvent::Response(DataResponse::Instruments(response)) = receiver.try_recv().unwrap() else { panic!("expected instruments response") };
-                assert_eq!(response.data.len(), 1);
-                assert_ne!(response.data[0].id(), id);
-            }
-        }
-        server.abort();
-    })).await.unwrap();
 }

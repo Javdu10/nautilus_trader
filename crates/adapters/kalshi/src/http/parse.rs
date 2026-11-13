@@ -162,8 +162,6 @@ impl Pagination {
 /// Maps an admitted ordinary market to the canonical YES-priced instrument.
 ///
 /// The retained market and event metadata restore grid and shard context on restart.
-/// Decoding a MECNET-capable binary instrument does not authorize trading: account-aware
-/// admission must separately establish disabled account and event collateral return.
 ///
 /// # Errors
 ///

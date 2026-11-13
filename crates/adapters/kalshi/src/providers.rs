@@ -39,12 +39,9 @@ use nautilus_model::instruments::{BinaryOption, InstrumentAny};
 use crate::{
     common::{
         consts::{KALSHI_CLIENT_ID, KALSHI_VENUE},
-        enums::{
-            CollateralReturnType, MarketStatus, MarketStatusFilter, MveFilter, MveHistoricalFilter,
-        },
+        enums::{MarketStatus, MarketStatusFilter, MveFilter, MveHistoricalFilter},
         parse::{parse_instrument_id, parse_ticker},
     },
-    config::KalshiDataClientConfig,
     http::{
         client::KalshiHttpClient,
         error::KalshiHttpError,
@@ -81,7 +78,6 @@ pub struct KalshiInstrumentProvider {
     pub(crate) http: KalshiHttpClient,
     pub(crate) clock: &'static AtomicTime,
     sender: EventSender<DataEvent>,
-    netting_config: Option<KalshiDataClientConfig>,
 }
 
 impl KalshiInstrumentProvider {
@@ -95,22 +91,7 @@ impl KalshiInstrumentProvider {
             http,
             clock,
             sender,
-            netting_config: None,
         }
-    }
-
-    pub(crate) fn with_netting_config(mut self, config: KalshiDataClientConfig) -> Self {
-        self.netting_config = Some(config);
-        self
-    }
-
-    async fn require_supported_market(&self, market: &Market, event: &Event) -> anyhow::Result<()> {
-        let http = if let Some(config) = &self.netting_config {
-            KalshiHttpClient::new_authenticated(config)?
-        } else {
-            self.http.clone()
-        };
-        http.require_supported_market(market, event).await
     }
 
     /// Fetches a fresh definition, falling back to the archive only after a live-market 404.
@@ -253,18 +234,6 @@ impl KalshiInstrumentProvider {
                 continue;
             }
 
-            if event.collateral_return_type == CollateralReturnType::Mecnet
-                && let Err(e) = self.require_supported_market(&market, event).await
-            {
-                if e.downcast_ref::<crate::http::netting::EventNettingError>()
-                    .is_some()
-                {
-                    log::warn!("Skipping Kalshi market {}: {e}", market.ticker);
-                    continue;
-                }
-                return Err(e);
-            }
-
             if !series.contains_key(&event.series_ticker) {
                 let definition = self.http.get_series(&event.series_ticker).await?.series;
                 series.insert(event.series_ticker.clone(), definition);
@@ -325,10 +294,6 @@ impl KalshiInstrumentProvider {
             selection.matches(&market, &event),
             "definition does not satisfy request filters"
         );
-
-        if event.collateral_return_type == CollateralReturnType::Mecnet {
-            self.require_supported_market(&market, &event).await?;
-        }
         let instrument = Self::parse(&market, &event, &series, self.clock.get_time_ns())?;
         anyhow::ensure!(
             start.is_none_or(|t| instrument.ts_event >= t)

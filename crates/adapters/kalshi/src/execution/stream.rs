@@ -126,9 +126,7 @@ impl PrivateStream {
                     }
                 }
                 Err(e) => {
-                    let fatal = e.downcast_ref::<RecoveryContextError>().is_some()
-                        || e.downcast_ref::<crate::http::netting::AccountNettingError>()
-                            .is_some();
+                    let fatal = e.downcast_ref::<RecoveryContextError>().is_some();
                     self.ready.store(false, Ordering::Release);
                     self.state
                         .lock()
@@ -176,8 +174,21 @@ impl PrivateStream {
         };
 
         let (balance, mut snapshot) = self.collect(receiver, &query, start).await?;
-        self.load_definitions(&snapshot).await?;
-        self.filter_incoming_events(&mut snapshot);
+        let events = super::snapshot::load_netted_events(
+            &self.http,
+            snapshot.positions.iter().chain(&snapshot.positions_settled),
+            &self.definitions,
+        )
+        .await?;
+        self.state
+            .lock()
+            .expect("private state lock is not poisoned")
+            .record_netted_events(events);
+        self.load_definitions(&snapshot, &[]).await?;
+        self.state
+            .lock()
+            .expect("private state lock is not poisoned")
+            .exclude_netting(&mut snapshot, &self.definitions);
         anyhow::ensure!(
             balance.balance_dollars.0 >= Decimal::ZERO
                 && balance.balance_dollars.0.normalize().scale() <= 4,
@@ -189,6 +200,7 @@ impl PrivateStream {
             .context("account timestamp overflow")?;
         let ts_event = UnixNanos::from(nanos);
         let settlements = self.prepare_settlements(&snapshot).await?;
+        self.load_definitions(&snapshot, &settlements).await?;
         let (plans, mut holds) = self.prepare_orders(&snapshot).await?;
 
         let missing: Vec<_> = {
@@ -422,22 +434,21 @@ impl PrivateStream {
         let data = match message {
             KalshiWsMessage::Fill(data)
             | KalshiWsMessage::UserOrder(data)
-            | KalshiWsMessage::MarketPosition(data) => Some(data),
-            _ => None,
+            | KalshiWsMessage::MarketPosition(data) => &data.msg,
+            _ => return false,
         };
-
-        if data
-            .and_then(|data| {
-                data.msg
-                    .get("market_ticker")
-                    .or_else(|| data.msg.get("ticker"))
-            })
+        let definition = data
+            .get("market_ticker")
+            .or_else(|| data.get("ticker"))
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|ticker| {
-                self.http
-                    .excludes_netting_event(ticker, self.config.exchange_index)
-            })
-        {
+            .and_then(|ticker| crate::common::parse::parse_instrument_id(ticker).ok())
+            .and_then(|id| self.definitions.get(&id));
+        if definition.is_some_and(|definition| {
+            self.state
+                .lock()
+                .expect("private state lock is not poisoned")
+                .is_netted(definition)
+        }) {
             return false;
         }
 
@@ -468,10 +479,8 @@ impl PrivateStream {
                         .invalidate();
                     anyhow::bail!("private connection changed during preparation")
                 }
-                KalshiWsEvent::Message { message, .. }
-                    if relevant(&message, &self.config.account_query()) && self.notice(&message) =>
-                {
-                    anyhow::bail!("private evidence changed during preparation");
+                KalshiWsEvent::Message { message, .. } if self.notice(&message) => {
+                    anyhow::bail!("private evidence changed during preparation")
                 }
                 _ => {}
             }
@@ -734,12 +743,15 @@ impl PrivateStream {
         Ok(settlements)
     }
 
-    async fn load_definitions(&mut self, snapshot: &KalshiExecutionSnapshot) -> anyhow::Result<()> {
-        let mut needed: HashSet<_> = self
-            .instruments
-            .iter()
-            .map(|id| id.symbol.to_string())
-            .collect();
+    async fn load_definitions(
+        &mut self,
+        snapshot: &KalshiExecutionSnapshot,
+        settlements: &[Settlement],
+    ) -> anyhow::Result<()> {
+        let mut needed = HashSet::new();
+        for settlement in settlements {
+            needed.insert(settlement.instrument_id.symbol.to_string());
+        }
 
         for order in &snapshot.orders {
             needed.insert(order.ticker.clone());
@@ -749,33 +761,19 @@ impl PrivateStream {
             needed.insert(position.ticker.clone());
         }
 
-        let settlement_targets: HashSet<_> = {
-            let state = self
-                .state
-                .lock()
-                .expect("private state lock is not poisoned");
-            state
-                .positions
-                .keys()
-                .chain(state.recovery_targets().iter())
-                .map(|id| id.symbol.to_string())
-                .chain(snapshot.fills.iter().map(|fill| fill.ticker.clone()))
-                .collect()
-        };
-
-        for position in &snapshot.positions_settled {
-            if settlement_targets.contains(&position.ticker) {
-                needed.insert(position.ticker.clone());
-            }
-        }
+        needed.extend(
+            snapshot
+                .positions_settled
+                .iter()
+                .filter(|position| position.netting_enabled)
+                .map(|position| position.ticker.clone()),
+        );
 
         {
             let state = self
                 .state
                 .lock()
                 .expect("private state lock is not poisoned");
-
-            needed.extend(state.positions.keys().map(|id| id.symbol.to_string()));
 
             for context in state
                 .orders
@@ -789,27 +787,22 @@ impl PrivateStream {
 
         for ticker in needed {
             let id = crate::common::parse::parse_instrument_id(&ticker)?;
-            let publish = !self.definitions.contains_key(&id);
-            if publish {
-                let definition = match load_definition(&self.http, &ticker, snapshot.ts_init).await
-                {
-                    Ok(definition) => definition,
-                    Err(e)
-                        if e.downcast_ref::<crate::http::netting::EventNettingError>()
-                            .is_some() =>
-                    {
-                        log::warn!("Ignoring Kalshi instrument {id} during recovery: {e}");
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
+            if !self.definitions.contains_key(&id) {
+                let definition = load_definition(&self.http, &ticker, snapshot.ts_init).await?;
                 super::validate_definition(&definition, self.config.exchange_index)?;
-                if publish && let Some(sender) = &self.data_sender {
+                if !self
+                    .state
+                    .lock()
+                    .expect("private state lock is not poisoned")
+                    .is_netted(&definition)
+                    && let Some(sender) = &self.data_sender
+                {
                     let data = InstrumentAny::BinaryOption(definition.clone()).into();
                     sender
                         .send(DataEvent::Data(data))
                         .map_err(|_| anyhow::anyhow!("private instrument receiver closed"))?;
                 }
+
                 self.definitions.insert(id, definition);
             }
         }
@@ -819,22 +812,6 @@ impl PrivateStream {
         }
 
         Ok(())
-    }
-
-    /// Skips unsupported incoming records before they enter normal reconciliation.
-    fn filter_incoming_events(&self, snapshot: &mut KalshiExecutionSnapshot) {
-        let excluded = |ticker: &str| {
-            self.http
-                .excludes_netting_event(ticker, self.config.exchange_index)
-        };
-        snapshot.orders.retain(|order| !excluded(&order.ticker));
-        snapshot.fills.retain(|fill| !excluded(&fill.ticker));
-        snapshot
-            .positions
-            .retain(|position| !excluded(&position.ticker));
-        snapshot
-            .positions_settled
-            .retain(|position| !excluded(&position.ticker));
     }
 
     async fn prepare_orders(
@@ -1298,212 +1275,6 @@ mod tests {
             ),
             (None, None) => assert_eq!(result.unwrap(), Decimal::new(6277, 4)),
         }
-    }
-
-    #[cfg(not(all(feature = "simulation", madsim)))]
-    #[tokio::test]
-    async fn mecnet_order_holds_rely_on_instrument_admission_without_netting_requests() {
-        use std::sync::atomic::AtomicUsize;
-
-        use nautilus_common::messages::data::RequestInstrument;
-
-        use crate::{
-            http::{
-                models::{Event, Market},
-                parse::parse_instrument,
-            },
-            providers::KalshiInstrumentProvider,
-        };
-
-        tokio::time::timeout(Duration::from_secs(15), async {
-            let definitions: serde_json::Value = serde_json::from_str(include_str!("../../test_data/instruments.json")).unwrap();
-            let market: Market = serde_json::from_value(definitions["definitions"]["unsupported"]["market"].clone()).unwrap();
-            let event: Event = serde_json::from_value(definitions["definitions"]["unsupported"]["event"].clone()).unwrap();
-            let instrument = parse_instrument(&market, &event, UnixNanos::from(1)).unwrap();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let transport = KalshiDataClientConfig {
-                base_url_http: Some(format!("http://{}", listener.local_addr().unwrap()).into()),
-                api_key_id: Some("cached-netting-key".into()),
-                private_key: Some(keys::ed25519_pkcs8().into()),
-                ..Default::default()
-            };
-            let observed = Arc::new(Mutex::new(Vec::new()));
-            let mode = Arc::new(AtomicUsize::new(0));
-            let server_mode = Arc::clone(&mode);
-            let response_market = definitions["definitions"]["unsupported"]["market"].clone();
-            let response_ticker = market.ticker.clone();
-            let response_event = definitions["definitions"]["unsupported"]["event"].clone();
-            let mut series = definitions["series"].clone();
-            series["series"]["ticker"] = response_event["series_ticker"].clone();
-            let fixtures: serde_json::Value = serde_json::from_str(include_str!("../../test_data/rest_responses.json")).unwrap();
-
-            let evidence = fixtures.clone();
-
-            let server = tokio::spawn(serve_recovery(listener, Arc::clone(&observed), move |target| { // tokio-import-ok
-                let body = if target.starts_with("/account/limits") {
-                    fixtures["limits"].clone()
-                } else if target.starts_with("/account/endpoint_costs") {
-                    fixtures["costs"].clone()
-                } else if target.starts_with("/portfolio/subaccounts/netting") {
-                    let current = server_mode.load(Ordering::SeqCst);
-                    if current == 2 { return (400, serde_json::json!({})); }
-                    if current == 6 { return (503, serde_json::json!({})); }
-                    serde_json::json!({"netting_configs": [{"subaccount_number": 0, "exchange_index": 0, "enabled": current == 1}]})
-                } else if target.starts_with("/portfolio/positions") {
-                    if server_mode.load(Ordering::SeqCst) == 5 { return (503, serde_json::json!({})); }
-                    if server_mode.load(Ordering::SeqCst) >= 3 {
-                        let mut row = fixtures["positions"]["market_positions"][0].clone();
-                        row["ticker"] = response_ticker.clone().into();
-                        row["exchange_index"] = 0.into();
-                        row["position_fp"] = "100.00".into();
-                        row["netting_enabled"] = true.into();
-                        if server_mode.load(Ordering::SeqCst) == 4 { row.as_object_mut().unwrap().remove("netting_enabled"); }
-                        serde_json::json!({"market_positions":[row],"event_positions":[],"cursor":""})
-                    } else { fixtures["empty_positions"].clone() }
-                } else if target.starts_with("/markets/") {
-                    serde_json::json!({"market": response_market})
-                } else if target.starts_with("/events/") {
-                    serde_json::json!({"event": response_event, "markets": []})
-                } else {
-                    assert!(target.starts_with("/series/"), "unexpected order-path request {target}");
-                    series.clone()
-                };
-                (200, body)
-            }));
-            let id = instrument.id;
-            let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-            let provider = KalshiInstrumentProvider::new(
-                KalshiHttpClient::new_authenticated(&transport).unwrap(),
-                get_atomic_clock_realtime(),
-                sender.into(),
-            );
-            let request = RequestInstrument::new(id, None, None, None, UUID4::new(), UnixNanos::from(1), None);
-            let instrument = provider.load_instrument(&request).await.unwrap();
-            let mut private = stream(&transport);
-            private.http = KalshiHttpClient::new_authenticated(&transport).unwrap();
-            private.definitions.insert(id, instrument);
-            observed.lock().unwrap().clear();
-
-            // An instrument admitted by a separate provider needs no execution-local netting cache
-            assert!(private.hold(id, OrderSide::Buy, Decimal::ONE, Decimal::new(6001, 4)).await.is_ok());
-            assert!(observed.lock().unwrap().iter().all(|path| !path.starts_with("/portfolio/")));
-            observed.lock().unwrap().clear();
-
-            for _ in 0..2 {
-                assert!(private.hold(id, OrderSide::Buy, Decimal::ONE, Decimal::new(6001, 4)).await.is_ok());
-            }
-            let paths = observed.lock().unwrap().clone();
-            assert_eq!(paths.len(), 4);
-            assert!(paths.iter().all(|path| path.starts_with("/events/") || path.starts_with("/series/")));
-
-            let empty = KalshiExecutionSnapshot {
-                orders: Vec::new(), fills: Vec::new(), positions: Vec::new(), positions_settled: Vec::new(),
-                cutoff: serde_json::from_value(evidence["cutoff"].clone()).unwrap(),
-                lookback_start: None, ts_init: UnixNanos::from(1),
-            };
-            private.instruments.insert(id);
-            private.http.require_supported_market(&market, &event).await.unwrap();
-            observed.lock().unwrap().clear();
-
-            // Routine recovery retains admitted definitions without another netting query
-            private.load_definitions(&empty).await.unwrap();
-            assert!(observed.lock().unwrap().is_empty());
-            assert!(!private.http.excludes_netting_event(&market.ticker, 0));
-
-            // HTTP failures retain their original type and do not resolve event exclusions
-            for current in [2, 5, 6] {
-                mode.store(current, Ordering::SeqCst);
-                observed.lock().unwrap().clear();
-                let e = private.http.require_supported_market(&market, &event).await.unwrap_err();
-                assert!(e.downcast_ref::<crate::http::error::KalshiHttpError>().is_some(), "{e:?}");
-                assert!(e.downcast_ref::<crate::http::netting::AccountNettingError>().is_none());
-                assert!(e.downcast_ref::<crate::http::netting::EventNettingError>().is_none());
-                assert!(!private.http.excludes_netting_event(&market.ticker, 0));
-
-                if current != 2 {
-                    let prefix = if current == 5 { "/portfolio/positions" } else { "/portfolio/subaccounts/netting" };
-                    assert_eq!(observed.lock().unwrap().iter().filter(|path| path.starts_with(prefix)).count(), 3);
-                }
-
-                let fresh = KalshiHttpClient::new_authenticated(&transport).unwrap();
-                let e = fresh.require_supported_market(&market, &event).await.unwrap_err();
-                assert!(e.downcast_ref::<crate::http::error::KalshiHttpError>().is_some(), "{e:?}");
-                assert!(!fresh.excludes_netting_event(&market.ticker, 0));
-            }
-
-            mode.store(1, Ordering::SeqCst);
-            let e = private.http.require_supported_market(&market, &event).await.unwrap_err();
-            assert!(e.downcast_ref::<crate::http::netting::AccountNettingError>().is_some());
-
-            for current in [3, 4] {
-                mode.store(current, Ordering::SeqCst);
-                let e = private.http.require_supported_market(&market, &event).await.unwrap_err();
-                assert!(e.downcast_ref::<crate::http::netting::EventNettingError>().is_some());
-                assert!(private.http.excludes_netting_event(&market.ticker, 0));
-
-                let mut order: crate::http::models::Order = serde_json::from_value(evidence["order"]["order"].clone()).unwrap();
-                order.ticker = market.ticker.clone();
-                let mut eligible_order = order.clone();
-                eligible_order.ticker = "ELIGIBLE-A".into();
-                let mut fill: crate::http::models::Fill = serde_json::from_value(evidence["fills"]["fills"][0].clone()).unwrap();
-                fill.ticker = market.ticker.clone();
-                fill.market_ticker = market.ticker.clone();
-                let mut eligible_fill = fill.clone();
-                eligible_fill.ticker = "ELIGIBLE-A".into();
-                let mut position: crate::http::models::MarketPosition = serde_json::from_value(evidence["positions"]["market_positions"][0].clone()).unwrap();
-                position.ticker = market.ticker.clone();
-                position.position_fp.0 = Decimal::from(100);
-                let mut eligible_position = position.clone();
-                eligible_position.ticker = "ELIGIBLE-A".into();
-                let eligible_id = crate::common::parse::parse_instrument_id("ELIGIBLE-A").unwrap();
-                {
-                    let mut state = private.state.lock().unwrap();
-                    state.positions.insert(eligible_id, Decimal::ONE);
-                }
-                let mut snapshot = KalshiExecutionSnapshot {
-                    orders: vec![order, eligible_order], fills: vec![fill, eligible_fill],
-                    positions: vec![position.clone(), eligible_position.clone()],
-                    positions_settled: vec![position, eligible_position],
-                    cutoff: serde_json::from_value(evidence["cutoff"].clone()).unwrap(),
-                    lookback_start: None, ts_init: UnixNanos::from(1),
-                };
-                let before = private.state.lock().unwrap().positions.clone();
-                private.filter_incoming_events(&mut snapshot);
-                assert_eq!(private.state.lock().unwrap().positions, before);
-                assert_eq!(snapshot.orders.len(), 1);
-                assert_eq!(snapshot.fills.len(), 1);
-                assert_eq!(snapshot.positions.len(), 1);
-                assert_eq!(snapshot.positions_settled.len(), 1);
-                assert_eq!(snapshot.positions[0].ticker, "ELIGIBLE-A");
-                {
-                    let state = private.state.lock().unwrap();
-                    assert!(!state.positions.contains_key(&id));
-                    assert_eq!(state.positions.get(&eligible_id), Some(&Decimal::ONE));
-                }
-
-                assert!(private.definitions.contains_key(&id));
-                assert_eq!(private.state.lock().unwrap().positions, before);
-
-                // A fresh client skips the unsupported requested instrument at ingestion
-                let mut fresh = stream(&transport);
-                fresh.http = KalshiHttpClient::new_authenticated(&transport).unwrap();
-                fresh.instruments.insert(id);
-                fresh.load_definitions(&empty).await.unwrap();
-                assert!(!fresh.definitions.contains_key(&id));
-                assert!(fresh.state.lock().unwrap().positions.is_empty());
-
-                // The excluded payload is deliberately unusable for normal position accounting.
-                private.ready.store(true, Ordering::Release);
-                let message = KalshiWsMessage::MarketPosition(crate::websocket::messages::KalshiDataMessage {
-                    id: None, sid: 1, seq: Some(1), sending_ts_ms: None,
-                    msg: serde_json::json!({"market_ticker": market.ticker, "position_fp": "not-normal-economics"}),
-                });
-                assert!(!private.notice(&message));
-                assert!(private.ready.load(Ordering::Acquire));
-                assert!(private.state.lock().unwrap().notices_positions.is_empty());
-            }
-            server.abort();
-        }).await.unwrap();
     }
 
     #[cfg(not(all(feature = "simulation", madsim)))]

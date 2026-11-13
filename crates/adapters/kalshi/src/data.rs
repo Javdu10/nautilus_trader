@@ -134,8 +134,7 @@ impl KalshiDataClient {
 
         let http = KalshiHttpClient::new(&config)?;
         let clock = get_atomic_clock_realtime();
-        let provider = KalshiInstrumentProvider::new(http, clock, sender.clone())
-            .with_netting_config(config.clone());
+        let provider = KalshiInstrumentProvider::new(http, clock, sender.clone());
 
         let books = BookSyncTracker::new(
             &instruments,
@@ -1281,17 +1280,7 @@ async fn refresh(
         let instrument = tokio::select! {
             biased;
             () = cancellation.cancelled() => anyhow::bail!("metadata refresh canceled"),
-            result = provider.load_instrument(&request) => match result {
-                Ok(instrument) => instrument,
-                Err(e) if e.downcast_ref::<crate::http::netting::EventNettingError>().is_some() => {
-                    if context.lock().expect("context lock is not poisoned").contains_key(id) {
-                        return Err(e);
-                    }
-                    log::warn!("Skipping Kalshi instrument {id}: {e}");
-                    continue;
-                }
-                Err(e) => return Err(e),
-            },
+            result = provider.load_instrument(&request) => result?,
         };
         lifecycle.apply(instrument, stamp, context, sender)?;
     }
