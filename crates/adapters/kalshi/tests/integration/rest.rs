@@ -68,6 +68,7 @@ fn exact_response_fixtures_roundtrip_every_mapped_field() {
     roundtrip::<HistoricalCutoff>("cutoff");
     roundtrip::<Balance>("balance");
     roundtrip::<PositionsResponse>("positions");
+    roundtrip::<SubaccountNettingResponse>("subaccount_netting");
     roundtrip::<SettlementsResponse>("settlements");
     roundtrip::<FillsResponse>("fills");
     roundtrip::<OrdersResponse>("orders");
@@ -86,6 +87,27 @@ fn exact_response_fixtures_roundtrip_every_mapped_field() {
     roundtrip::<OrdersResponse>("empty_orders");
     roundtrip::<PositionsResponse>("empty_positions");
     roundtrip::<SettlementsResponse>("empty_settlements");
+}
+
+#[rstest]
+#[case(None)]
+#[case(Some(Value::Null))]
+#[case(Some(Value::String("false".into())))]
+fn netting_flags_are_required_booleans(#[case] invalid: Option<Value>) {
+    let mut position = fixture("positions")["market_positions"][0].clone();
+    let mut account = fixture("subaccount_netting");
+
+    for (record, field) in [
+        (&mut position, "netting_enabled"),
+        (&mut account["netting_configs"][0], "enabled"),
+    ] {
+        record.as_object_mut().unwrap().remove(field);
+        if let Some(value) = &invalid {
+            record[field] = value.clone();
+        }
+    }
+    assert!(serde_json::from_value::<MarketPosition>(position).is_err());
+    assert!(serde_json::from_value::<SubaccountNettingResponse>(account).is_err());
 }
 
 #[rstest]
@@ -219,6 +241,13 @@ fn field_presence_and_unknown_order_status_are_preserved() {
     "/portfolio/balance?subaccount=0&exchange_index=3",
     true,
     "balance"
+)]
+#[case(
+    "subaccount_netting",
+    "GET",
+    "/portfolio/subaccounts/netting",
+    true,
+    "subaccount_netting"
 )]
 #[case(
     "positions",
@@ -477,6 +506,7 @@ async fn call(
     }
 
     match operation {
+        "subaccount_netting" => value!(client.get_subaccount_netting()),
         "status" => value!(client.get_status()),
         "markets" => value!(client.get_markets(&MarketsQuery {
             limit: Some(2),

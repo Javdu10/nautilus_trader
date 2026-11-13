@@ -26,6 +26,7 @@ use nautilus_core::{
     time::get_atomic_clock_realtime,
 };
 use nautilus_model::{identifiers::InstrumentId, instruments::BinaryOption, orders::OrderAny};
+use ustr::Ustr;
 
 use crate::{
     common::enums::{OrderStatusFilter, PositionSettlementStatus},
@@ -42,6 +43,35 @@ use crate::{
 };
 
 const RECOVERY_MAX_PAGES: u32 = 100;
+
+pub(super) async fn load_netted_events<'a>(
+    http: &KalshiHttpClient,
+    positions: impl Iterator<Item = &'a MarketPosition>,
+    definitions: &HashMap<InstrumentId, BinaryOption>,
+) -> anyhow::Result<HashSet<Ustr>> {
+    let mut events = HashSet::new();
+
+    for position in positions.filter(|position| position.netting_enabled) {
+        let id = crate::common::parse::parse_instrument_id(&position.ticker)?;
+        if let Some(event) = definitions
+            .get(&id)
+            .and_then(|definition| definition.event_id)
+        {
+            events.insert(event);
+            continue;
+        }
+
+        let market =
+            crate::providers::KalshiInstrumentProvider::load_market(http, &position.ticker).await?;
+        anyhow::ensure!(
+            market.ticker == position.ticker,
+            "position market identity mismatch"
+        );
+        events.insert(Ustr::from(&market.event_ticker));
+    }
+
+    Ok(events)
+}
 
 /// Complete REST source collection for one subaccount and shard.
 ///

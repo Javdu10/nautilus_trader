@@ -39,6 +39,7 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use ustr::Ustr;
 
 use super::{
     account::{AccountLedger, ReservationId},
@@ -58,6 +59,7 @@ use crate::{
 /// Execution state the private stream uses to turn venue evidence into order events.
 #[derive(Debug)]
 pub struct PrivateState {
+    pub(super) netted_events: HashSet<Ustr>,
     pub(super) ledger: AccountLedger,
     pub(super) barrier: Arc<Mutex<SettlementBarrier>>,
     pub(super) orders: HashMap<ClientOrderId, PrivateOrder>,
@@ -93,6 +95,7 @@ impl PrivateState {
     )]
     pub fn new() -> Self {
         Self {
+            netted_events: HashSet::new(),
             ledger: AccountLedger::new(),
             barrier: Arc::new(Mutex::new(SettlementBarrier::default())),
             orders: HashMap::new(),
@@ -114,6 +117,62 @@ impl PrivateState {
             notices_orders: HashMap::new(),
             notices_positions: HashMap::new(),
         }
+    }
+
+    pub(super) fn is_netted(&self, instrument: &BinaryOption) -> bool {
+        instrument
+            .event_id
+            .is_some_and(|event| self.netted_events.contains(&event))
+    }
+
+    pub(super) fn record_netted_events(&mut self, events: HashSet<Ustr>) {
+        for event in events {
+            if self.netted_events.insert(event) {
+                log::warn!("Ignoring Kalshi event {event}: saved position netting is enabled");
+            }
+        }
+    }
+
+    pub(super) fn exclude_netting(
+        &mut self,
+        snapshot: &mut super::snapshot::KalshiExecutionSnapshot,
+        definitions: &HashMap<InstrumentId, BinaryOption>,
+    ) {
+        let excluded: HashSet<_> = definitions
+            .values()
+            .filter(|definition| self.is_netted(definition))
+            .map(|definition| definition.id)
+            .collect();
+
+        for order in snapshot.orders.iter().filter(|order| {
+            crate::common::parse::parse_instrument_id(&order.ticker)
+                .is_ok_and(|id| excluded.contains(&id))
+        }) {
+            if let Ok(id) = VenueOrderId::new_checked(&order.order_id) {
+                self.notices_orders.remove(&id);
+            }
+        }
+
+        self.notices_fills
+            .retain(|_, notice| notice.instrument.is_none_or(|id| !excluded.contains(&id)));
+        self.notices_positions
+            .retain(|id, _| !excluded.contains(id));
+        self.positions.retain(|id, _| !excluded.contains(id));
+        self.orders
+            .retain(|_, context| !excluded.contains(&context.order.instrument_id()));
+
+        let included = |ticker: &str| {
+            crate::common::parse::parse_instrument_id(ticker)
+                .map_or(true, |id| !excluded.contains(&id))
+        };
+        snapshot.orders.retain(|order| included(&order.ticker));
+        snapshot.fills.retain(|fill| included(&fill.ticker));
+        snapshot
+            .positions
+            .retain(|position| !position.netting_enabled && included(&position.ticker));
+        snapshot
+            .positions_settled
+            .retain(|position| !position.netting_enabled && included(&position.ticker));
     }
 
     pub(super) fn requires_rebase(&self, order: &OrderAny) -> bool {

@@ -428,6 +428,20 @@ pub struct IndexedBalance {
     pub balance: FixedPoint,
 }
 
+/// Netting default for one subaccount and exchange shard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubaccountNettingConfig {
+    pub subaccount_number: u32,
+    pub exchange_index: u32,
+    pub enabled: bool,
+}
+
+/// Netting defaults returned for the authenticated account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubaccountNettingResponse {
+    pub netting_configs: Vec<SubaccountNettingConfig>,
+}
+
 /// Signed market position and exact economics, without an inferred entry price.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketPosition {
@@ -439,6 +453,8 @@ pub struct MarketPosition {
     pub realized_pnl_dollars: FixedPoint,
     pub fees_paid_dollars: FixedPoint,
     pub last_updated_ts: Timestamp,
+    /// Saved event setting, fixed at the subaccount's first order in the event.
+    pub netting_enabled: bool,
 }
 
 /// Event-level position economics.

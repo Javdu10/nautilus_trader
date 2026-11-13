@@ -310,14 +310,10 @@ fn unsupported_and_inconsistent_metadata_is_rejected(#[case] mutation: &str) {
 }
 
 #[rstest]
-fn captured_netting_event_is_rejected() {
+fn captured_mecnet_event_is_supported() {
     let (market, event) = definition("unsupported");
-    assert_eq!(
-        parse_instrument(&market, &event, UnixNanos::from(1))
-            .unwrap_err()
-            .to_string(),
-        "unsupported market economics or family"
-    );
+    let instrument = parse_instrument(&market, &event, UnixNanos::from(1)).unwrap();
+    assert_eq!(instrument.event_id.unwrap().as_str(), event.event_ticker);
 }
 
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]

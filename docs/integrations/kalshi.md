@@ -148,12 +148,18 @@ The instrument provider accepts only markets with:
 - `settlement_bounds_type=default`.
 - USD 1 contract notional.
 - No multivariate collection or selected legs.
-- The documented empty `collateral_return_type`, indicating no collateral-return netting.
+- An empty `collateral_return_type` or `MECNET`.
 
 #### Rejection rules and unsupported operations
 
-- **Rejected economics**: The provider rejects unknown product or collateral behavior, `MECNET`,
-  `DIRECNET`, scalar payouts, and nonzero settlement floors.
+- **Rejected economics**: The provider rejects unknown product or collateral behavior, `DIRECNET`,
+  scalar payouts, and nonzero settlement floors.
+- **Disabled netting only**: Execution startup requires account netting to be disabled for the
+  configured `subaccount` and `exchange_index`. A saved position's `netting_enabled=true` excludes
+  its event from execution recovery and reports, including instruments already cached by data.
+  Zero-quantity position history still carries the saved setting. Excluded events are logged and
+  cannot receive new orders. Market-data definitions remain public and independent of account
+  settings.
 - **Netting test**: `mutually_exclusive=false` does not prove that an event has no netting.
 - **Settlement floors**: A missing, null, or zero `settlement_floor_dollars` does not exclude an
   ordinary contract.

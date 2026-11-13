@@ -227,14 +227,16 @@ impl KalshiExecutionClient {
         Ok(())
     }
 
-    async fn definition(&self, ticker: &str, ts_init: UnixNanos) -> anyhow::Result<BinaryOption> {
+    async fn definition(
+        &self,
+        ticker: &str,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<Option<BinaryOption>> {
         let id = parse_instrument_id(ticker)?;
         let known = self.definitions.borrow().get(&id).cloned();
-        if let Some(instrument) = known {
-            return Ok(instrument);
-        }
-
-        let cached = self.core.cache().instrument(&id).cloned();
+        let cached = known
+            .map(InstrumentAny::BinaryOption)
+            .or_else(|| self.core.cache().instrument(&id).cloned());
         let unloaded = cached.is_none();
 
         let instrument = if let Some(instrument) = cached {
@@ -248,6 +250,17 @@ impl KalshiExecutionClient {
         };
 
         validate_definition(&instrument, self.config.exchange_index)?;
+        self.definitions.borrow_mut().insert(id, instrument.clone());
+
+        if self
+            .private
+            .lock()
+            .expect("private state lock is not poisoned")
+            .is_netted(&instrument)
+        {
+            return Ok(None);
+        }
+
         if unloaded && let Some(sender) = try_get_data_event_sender() {
             let data = InstrumentAny::BinaryOption(instrument.clone()).into();
             sender
@@ -255,8 +268,19 @@ impl KalshiExecutionClient {
                 .map_err(|_| anyhow::anyhow!("instrument receiver closed"))?;
         }
 
-        self.definitions.borrow_mut().insert(id, instrument.clone());
-        Ok(instrument)
+        Ok(Some(instrument))
+    }
+
+    fn excluded_ticker(&self, ticker: &str) -> bool {
+        parse_instrument_id(ticker)
+            .ok()
+            .and_then(|id| self.definitions.borrow().get(&id).cloned())
+            .is_some_and(|definition| {
+                self.private
+                    .lock()
+                    .expect("private state lock is not poisoned")
+                    .is_netted(&definition)
+            })
     }
 
     fn client_order_id(&self, value: &VenueOrder) -> anyhow::Result<Option<ClientOrderId>> {
@@ -303,7 +327,9 @@ impl KalshiExecutionClient {
         value: &VenueOrder,
         ts_init: UnixNanos,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let definition = self.definition(&value.ticker, ts_init).await?;
+        let Some(definition) = self.definition(&value.ticker, ts_init).await? else {
+            return Ok(None);
+        };
         let cached = self.cached_order(value)?;
         let report = reports::order(
             value,
@@ -323,6 +349,10 @@ impl KalshiExecutionClient {
         max_pages: u32,
         cutoff: Option<&HistoricalCutoff>,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
+        if self.definition(&value.ticker, ts_init).await?.is_none() {
+            return Ok(None);
+        }
+
         let recovered = self
             .private
             .lock()
@@ -337,7 +367,9 @@ impl KalshiExecutionClient {
             .as_ref()
             .filter(|order| order.status() == OrderStatus::Rejected)
         {
-            let definition = self.definition(&value.ticker, ts_init).await?;
+            let Some(definition) = self.definition(&value.ticker, ts_init).await? else {
+                return Ok(None);
+            };
             let report = reports::order_aggregate(
                 value,
                 &definition,
@@ -395,8 +427,10 @@ impl KalshiExecutionClient {
         value: &Fill,
         source: &VenueOrder,
         ts_init: UnixNanos,
-    ) -> anyhow::Result<FillReport> {
-        let definition = self.definition(&value.ticker, ts_init).await?;
+    ) -> anyhow::Result<Option<FillReport>> {
+        let Some(definition) = self.definition(&value.ticker, ts_init).await? else {
+            return Ok(None);
+        };
         let mut report = reports::fill(value, &definition, self.core.account_id, source, ts_init)?;
         let cached = self.cached_order(source)?;
         if let Some(cached) = cached {
@@ -411,7 +445,7 @@ impl KalshiExecutionClient {
             report.client_order_id = Some(cached.client_order_id());
         }
 
-        Ok(report)
+        Ok(Some(report))
     }
 
     fn admit_reports(
@@ -732,6 +766,21 @@ impl ExecutionClient for KalshiExecutionClient {
 
         self.stop()?;
         self.finish_shutdown().await?;
+        let account = self.http.get_subaccount_netting().await?;
+        let setting = account
+            .netting_configs
+            .iter()
+            .find(|setting| {
+                setting.subaccount_number == self.config.subaccount
+                    && setting.exchange_index == self.config.exchange_index
+            })
+            .context("Kalshi account netting setting is missing")?;
+        anyhow::ensure!(
+            !setting.enabled,
+            "Kalshi account netting must be disabled for subaccount {}/shard {}",
+            self.config.subaccount,
+            self.config.exchange_index
+        );
         self.session_tasks.start_generation()?;
         self.command_tasks.start_generation()?;
         self.restore_cache()?;
@@ -1172,6 +1221,11 @@ impl ExecutionClient for KalshiExecutionClient {
                 ),
             "targeted order identity mismatch"
         );
+
+        if self.definition(&value.ticker, ts_init).await?.is_none() {
+            return Ok(None);
+        }
+
         let report = self
             .order_report(value, ts_init)
             .await?
@@ -1220,7 +1274,8 @@ impl ExecutionClient for KalshiExecutionClient {
                 .await?
             {
                 Some(report) => reports.push(report),
-                None => omitted += 1,
+                None if !self.excluded_ticker(&value.ticker) => omitted += 1,
+                None => {}
             }
         }
 
@@ -1282,12 +1337,14 @@ impl ExecutionClient for KalshiExecutionClient {
             let order = orders
                 .get(value.order_id.as_str())
                 .context("fill lacks order evidence")?;
-            reports.push(self.fill_report(value, order, ts_init).await?);
+            reports.extend(self.fill_report(value, order, ts_init).await?);
         }
 
         let selected_orders = orders.values().filter(|order| {
-            cmd.instrument_id
-                .is_none_or(|id| id.symbol.as_str() == order.ticker)
+            !self.excluded_ticker(&order.ticker)
+                && cmd
+                    .instrument_id
+                    .is_none_or(|id| id.symbol.as_str() == order.ticker)
                 && cmd
                     .venue_order_id
                     .is_none_or(|id| id.as_str() == order.order_id)
@@ -1315,6 +1372,13 @@ impl ExecutionClient for KalshiExecutionClient {
             max_pages,
         )
         .await?;
+        let definitions = self.definitions.borrow().clone();
+        let events =
+            snapshot::load_netted_events(&self.http, positions.iter(), &definitions).await?;
+        self.private
+            .lock()
+            .expect("private state lock is not poisoned")
+            .record_netted_events(events);
         let mut reports = Vec::new();
 
         for value in &positions {
@@ -1325,7 +1389,9 @@ impl ExecutionClient for KalshiExecutionClient {
                 continue;
             }
 
-            let definition = self.definition(&value.ticker, ts_init).await?;
+            let Some(definition) = self.definition(&value.ticker, ts_init).await? else {
+                continue;
+            };
             let report = reports::position(value, &definition, self.core.account_id, ts_init)?;
             if cmd.start.is_none_or(|start| report.ts_last >= start)
                 && cmd.end.is_none_or(|end| report.ts_last <= end)
@@ -1347,7 +1413,7 @@ impl ExecutionClient for KalshiExecutionClient {
             .transpose()?
             .map(|duration| requested_at.saturating_sub(duration));
         let max_pages = 100;
-        let snapshot = collect_snapshot_at(
+        let mut snapshot = collect_snapshot_at(
             &self.http,
             &self.config.account_query(),
             start,
@@ -1355,6 +1421,17 @@ impl ExecutionClient for KalshiExecutionClient {
             requested_at,
         )
         .await?;
+        let definitions = self.definitions.borrow().clone();
+        let events = snapshot::load_netted_events(
+            &self.http,
+            snapshot.positions.iter().chain(&snapshot.positions_settled),
+            &definitions,
+        )
+        .await?;
+        self.private
+            .lock()
+            .expect("private state lock is not poisoned")
+            .record_netted_events(events);
         let mut orders = Vec::new();
         let mut omitted = 0;
 
@@ -1369,9 +1446,17 @@ impl ExecutionClient for KalshiExecutionClient {
                 .await?
             {
                 Some(report) => orders.push(report),
-                None => omitted += 1,
+                None if !self.excluded_ticker(&value.ticker) => omitted += 1,
+                None => {}
             }
         }
+
+        snapshot
+            .orders
+            .retain(|order| !self.excluded_ticker(&order.ticker));
+        snapshot
+            .fills
+            .retain(|fill| !self.excluded_ticker(&fill.ticker));
 
         let source_orders: HashMap<_, _> = snapshot
             .orders
@@ -1384,8 +1469,7 @@ impl ExecutionClient for KalshiExecutionClient {
             let source = source_orders
                 .get(value.order_id.as_str())
                 .context("fill lacks order evidence")?;
-            let report = self.fill_report(value, source, snapshot.ts_init).await?;
-            fills.push(report);
+            fills.extend(self.fill_report(value, source, snapshot.ts_init).await?);
         }
 
         validate_fill_coverage(
@@ -1398,7 +1482,9 @@ impl ExecutionClient for KalshiExecutionClient {
         let mut positions = Vec::new();
 
         for value in &snapshot.positions {
-            let definition = self.definition(&value.ticker, snapshot.ts_init).await?;
+            let Some(definition) = self.definition(&value.ticker, snapshot.ts_init).await? else {
+                continue;
+            };
             let report =
                 reports::position(value, &definition, self.core.account_id, snapshot.ts_init)?;
             anyhow::ensure!(
@@ -1641,6 +1727,14 @@ impl KalshiExecutionClient {
         };
 
         validate_definition(&definition, self.config.exchange_index)?;
+        anyhow::ensure!(
+            !self
+                .private
+                .lock()
+                .expect("private state lock is not poisoned")
+                .is_netted(&definition),
+            "Kalshi instrument has saved event netting enabled"
+        );
         let ws_client = self
             .ws_client
             .clone()
@@ -1856,6 +1950,14 @@ impl KalshiExecutionClient {
         };
 
         validate_definition(&definition, self.config.exchange_index)?;
+        anyhow::ensure!(
+            !self
+                .private
+                .lock()
+                .expect("private state lock is not poisoned")
+                .is_netted(&definition),
+            "Kalshi instrument has saved event netting enabled"
+        );
         let ws_client = self
             .ws_client
             .clone()

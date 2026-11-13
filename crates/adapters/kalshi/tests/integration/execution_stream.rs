@@ -115,7 +115,9 @@ struct Peer {
     batches: Arc<BatchPeer>,
     limits: Arc<Mutex<Value>>,
     costs: Arc<Mutex<Value>>,
+    netting: Arc<Mutex<Value>>,
     market: Arc<Mutex<Value>>,
+    event: Arc<Mutex<Value>>,
     market_overrides: Arc<Mutex<HashMap<String, Value>>>,
     market_gate: Arc<tokio::sync::Semaphore>,
     market_read: Arc<tokio::sync::Notify>,
@@ -222,6 +224,10 @@ impl Peer {
         let batches_http = Arc::clone(&batches);
         let limits = Arc::new(Mutex::new(f["limits"].clone()));
         let costs = Arc::new(Mutex::new(f["costs"].clone()));
+        let mut account_netting = f["subaccount_netting"].clone();
+        account_netting["netting_configs"][0]["subaccount_number"] = subaccount.into();
+        let netting = Arc::new(Mutex::new(account_netting));
+        let netting_http = Arc::clone(&netting);
         let limits_http = Arc::clone(&limits);
         let costs_http = Arc::clone(&costs);
         let changes_http = Arc::clone(&changes);
@@ -232,6 +238,10 @@ impl Peer {
         ));
 
         let market_http = Arc::clone(&market);
+        let event = Arc::new(Mutex::new(
+            definitions["definitions"]["live"]["event"].clone(),
+        ));
+        let event_http = Arc::clone(&event);
         let market_overrides = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
         let overrides_http = Arc::clone(&market_overrides);
 
@@ -306,6 +316,7 @@ impl Peer {
                     }
                     "/account/limits" => limits_http.lock().unwrap().clone(),
                     "/account/endpoint_costs" => costs_http.lock().unwrap().clone(),
+                    "/portfolio/subaccounts/netting" => netting_http.lock().unwrap().clone(),
                     "/portfolio/balance" => {
                         let balance = current.lock().unwrap().clone();
                         reads.fetch_add(1, Ordering::SeqCst);
@@ -352,7 +363,7 @@ impl Peer {
                         f["empty_positions"].clone()
                     }
                     _ if path.starts_with("/events/") => {
-                        json!({"event": definitions["definitions"]["live"]["event"], "markets": []})
+                        json!({"event": event_http.lock().unwrap().clone(), "markets": []})
                     }
                     _ if path.starts_with("/markets/") => {
                         let ticker = path.strip_prefix("/markets/").unwrap();
@@ -452,7 +463,9 @@ impl Peer {
             batches,
             limits,
             costs,
+            netting,
             market,
+            event,
             market_overrides,
             market_gate,
             market_read,
@@ -580,6 +593,92 @@ fn account(event: ExecutionEvent, cache: &Rc<RefCell<Cache>>) -> AccountState {
         .add_account(AccountAny::from(state.clone()))
         .unwrap();
     state
+}
+
+#[rstest]
+#[tokio::test]
+async fn account_netting_checks_the_selected_subaccount_on_each_connection(
+    #[values(0, 7)] subaccount: u32,
+) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let peer = Peer::with_scope(None, 2, subaccount).await;
+        peer.netting.lock().unwrap()["netting_configs"].as_array_mut().unwrap()
+            .push(json!({"subaccount_number": 63, "exchange_index": 3, "enabled": true}));
+        peer.event.lock().unwrap()["collateral_return_type"] = "MECNET".into();
+        let (mut client, cache, mut output) = client(&peer);
+        {
+            let connect = client.connect();
+            tokio::pin!(connect);
+            let event = tokio::select! {
+                result = &mut connect => panic!("connection returned before account observation: {result:?}"),
+                event = output.recv() => event.unwrap(),
+            };
+            account(event, &cache);
+            connect.await.unwrap();
+        }
+        client.disconnect().await.unwrap();
+        peer.netting.lock().unwrap()["netting_configs"][0]["enabled"] = true.into();
+        let reads = peer.balance_reads.load(Ordering::SeqCst);
+
+        let e = client.connect().await.unwrap_err();
+        assert!(e.to_string().contains(&format!("subaccount {subaccount}/shard 3")), "{e}");
+        assert!(!client.is_connected());
+        assert_eq!(peer.balance_reads.load(Ordering::SeqCst), reads);
+        assert!(output.try_recv().is_err());
+    }).await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn saved_netting_excludes_cached_instruments_and_position_history(
+    #[values("0.00", "1.00")] quantity: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let peer = Peer::with_scope(None, 2, 7).await;
+        peer.event.lock().unwrap()["collateral_return_type"] = "MECNET".into();
+        let market: Market = serde_json::from_value(peer.market.lock().unwrap().clone()).unwrap();
+        let event: Event = serde_json::from_value(peer.event.lock().unwrap().clone()).unwrap();
+        let instrument = parse_instrument(&market, &event, UnixNanos::from(1)).unwrap();
+        let fixtures: Value = serde_json::from_str(include_str!("../../test_data/rest_responses.json")).unwrap();
+        let mut position = fixtures["positions"]["market_positions"][0].clone();
+        position["ticker"] = instrument.id.symbol.as_str().into();
+        position["position_fp"] = quantity.into();
+        position["netting_enabled"] = true.into();
+        peer.positions.lock().unwrap()["market_positions"] = json!([position]);
+        let (mut client, cache, mut output) = client(&peer);
+        cache.borrow_mut().add_instrument(instrument.clone().into()).unwrap();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id("TEST-001".into()).instrument_id(instrument.id)
+            .client_order_id("cached-netted".into()).side(OrderSide::Buy)
+            .quantity(Quantity::from("1.00")).price(Price::from("0.600000")).build();
+        cache.borrow_mut().add_order(order, None, Some(client.client_id()), false).unwrap();
+        {
+            let connect = client.connect();
+            tokio::pin!(connect);
+            let event = tokio::select! {
+                result = &mut connect => panic!("connection returned before account observation: {result:?}"),
+                event = output.recv() => event.unwrap(),
+            };
+            account(event, &cache);
+            connect.await.unwrap();
+        }
+
+        let reports = client.generate_position_status_reports(&GeneratePositionStatusReports::new(
+            UUID4::new(), UnixNanos::from(1), Some(instrument.id), None, None, None, None,
+        )).await.unwrap();
+        assert!(reports.is_empty());
+        assert!(output.try_recv().is_err());
+        assert_eq!(cache.borrow().order(&"cached-netted".into()).unwrap().status(), OrderStatus::Initialized);
+        let order = cache.borrow().order(&"cached-netted".into()).unwrap().clone();
+        client.submit_order(SubmitOrder::from_order(&order, order.trader_id(), Some(client.client_id()),
+            None, UUID4::new(), UnixNanos::from(1))).unwrap();
+        let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = output.recv().await.unwrap() else {
+            panic!("expected netting rejection");
+        };
+        assert!(denied.reason.contains("netting"));
+        assert!(peer.submissions.writes.lock().unwrap().is_empty());
+        client.disconnect().await.unwrap();
+    }).await.unwrap();
 }
 
 fn account_or_recovered_order(

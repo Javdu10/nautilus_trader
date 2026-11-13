@@ -462,6 +462,18 @@ impl KalshiHttpClient {
         self.get(&["portfolio", "balance"], query, true).await
     }
 
+    /// Fetches netting defaults for all subaccounts and exchange shards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authentication, transport, or decoding fails.
+    pub async fn get_subaccount_netting(
+        &self,
+    ) -> Result<SubaccountNettingResponse, KalshiHttpError> {
+        self.get(&["portfolio", "subaccounts", "netting"], &(), true)
+            .await
+    }
+
     /// Fetches one live market/event position page.
     ///
     /// # Errors

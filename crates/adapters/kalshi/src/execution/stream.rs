@@ -173,7 +173,22 @@ impl PrivateStream {
             (state.start, state.ledger.begin_refresh())
         };
 
-        let (balance, snapshot) = self.collect(receiver, &query, start).await?;
+        let (balance, mut snapshot) = self.collect(receiver, &query, start).await?;
+        let events = super::snapshot::load_netted_events(
+            &self.http,
+            snapshot.positions.iter().chain(&snapshot.positions_settled),
+            &self.definitions,
+        )
+        .await?;
+        self.state
+            .lock()
+            .expect("private state lock is not poisoned")
+            .record_netted_events(events);
+        self.load_definitions(&snapshot, &[]).await?;
+        self.state
+            .lock()
+            .expect("private state lock is not poisoned")
+            .exclude_netting(&mut snapshot, &self.definitions);
         anyhow::ensure!(
             balance.balance_dollars.0 >= Decimal::ZERO
                 && balance.balance_dollars.0.normalize().scale() <= 4,
@@ -416,6 +431,27 @@ impl PrivateStream {
             return false;
         }
 
+        let data = match message {
+            KalshiWsMessage::Fill(data)
+            | KalshiWsMessage::UserOrder(data)
+            | KalshiWsMessage::MarketPosition(data) => &data.msg,
+            _ => return false,
+        };
+        let definition = data
+            .get("market_ticker")
+            .or_else(|| data.get("ticker"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|ticker| crate::common::parse::parse_instrument_id(ticker).ok())
+            .and_then(|id| self.definitions.get(&id));
+        if definition.is_some_and(|definition| {
+            self.state
+                .lock()
+                .expect("private state lock is not poisoned")
+                .is_netted(definition)
+        }) {
+            return false;
+        }
+
         self.ready.store(false, Ordering::Release);
         let mut state = self
             .state
@@ -443,10 +479,7 @@ impl PrivateStream {
                         .invalidate();
                     anyhow::bail!("private connection changed during preparation")
                 }
-                KalshiWsEvent::Message { message, .. }
-                    if relevant(&message, &self.config.account_query()) =>
-                {
-                    self.notice(&message);
+                KalshiWsEvent::Message { message, .. } if self.notice(&message) => {
                     anyhow::bail!("private evidence changed during preparation")
                 }
                 _ => {}
@@ -526,8 +559,7 @@ impl PrivateStream {
                     Some(KalshiWsEvent::Ready { .. }) => { changed = true; self.state.lock().expect("private state lock is not poisoned").invalidate(); },
                     Some(KalshiWsEvent::Message { message, .. }) => {
                         if relevant(&message, query) {
-                            changed = true;
-                            self.notice(&message);
+                            changed |= self.notice(&message);
                         }
                     },
                     Some(_) => {},
@@ -729,6 +761,14 @@ impl PrivateStream {
             needed.insert(position.ticker.clone());
         }
 
+        needed.extend(
+            snapshot
+                .positions_settled
+                .iter()
+                .filter(|position| position.netting_enabled)
+                .map(|position| position.ticker.clone()),
+        );
+
         {
             let state = self
                 .state
@@ -750,7 +790,13 @@ impl PrivateStream {
             if !self.definitions.contains_key(&id) {
                 let definition = load_definition(&self.http, &ticker, snapshot.ts_init).await?;
                 super::validate_definition(&definition, self.config.exchange_index)?;
-                if let Some(sender) = &self.data_sender {
+                if !self
+                    .state
+                    .lock()
+                    .expect("private state lock is not poisoned")
+                    .is_netted(&definition)
+                    && let Some(sender) = &self.data_sender
+                {
                     let data = InstrumentAny::BinaryOption(definition.clone()).into();
                     sender
                         .send(DataEvent::Data(data))
